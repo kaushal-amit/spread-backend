@@ -1,0 +1,27 @@
+{
+  "name": "spread-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SPREAD — passive market-making engine for Boursa Kuwait",
+  "main": "src/index.js",
+  "scripts": {
+    "migrate": "node src/db/migrate.js",
+    "migrate:dry": "node src/db/migrate.js --dry-run",
+    "calendar": "node src/db/seed-calendar.js",
+    "job:daily": "node src/jobs/daily/index.js",
+    "lint:rules": "sh scripts/lint-rules.sh",
+    "test": "node test/run.js",
+    "verify": "npm run lint:rules && npm test",
+    "start": "node src/index.js",
+    "mcp": "node src/mcp/server.js",
+    "doctor": "node src/db/doctor.js",
+    "seed:symbols": "node src/db/seed-symbols.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "pg-mem": "^3.0.14",
+    "socket.io": "^4.8.1"
+  }
+}

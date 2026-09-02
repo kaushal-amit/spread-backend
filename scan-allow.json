@@ -1,0 +1,60 @@
+{
+  "columns": [
+    {
+      "name": "id",
+      "reason": "bigserial primary keys, reached by RETURNING and foreign keys rather than by name.",
+      "until": "2026-12-31"
+    }
+  ],
+  "tables": [
+    {
+      "name": "spread.quote",
+      "reason": "the fallback 002 no longer takes \u2014 it now RAISEs instead. Kept so an applied migration need not be edited; a reader would recreate the second-source-of-truth the schema boundary prevents.",
+      "until": "2026-10-31"
+    },
+    {
+      "name": "spread.depth",
+      "reason": "same as spread.quote \u2014 created by 007 unconditionally, written by nothing, read by nothing.",
+      "until": "2026-10-31"
+    }
+  ],
+  "modules": [
+    {
+      "name": "src/db/doctor.js",
+      "reason": "a diagnostic run by hand: node src/db/doctor.js. Entry points are not imported by definition.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "src/db/seed-calendar.js",
+      "reason": "run by hand via npm run calendar. Same as doctor.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "src/db/seed-symbols.js",
+      "reason": "run by hand. Same as doctor.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "src/jobs/daily/index.js",
+      "reason": "INERT \u2014 it computed spread.symbol_day and spread.market_day, which are now VIEWS over public.*. Kept with a comment saying what replaced it; do not wire it back up.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "src/jobs/daily/steps/index.js",
+      "reason": "the steps of the inert daily job above.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "src/jobs/reconcile-fees.js",
+      "reason": "run nightly by hand or by cron, not imported by the server. Will be wired to the scheduler when one exists.",
+      "until": "2026-10-31"
+    }
+  ],
+  "functions": [
+    {
+      "name": "source",
+      "reason": "a word inside this scanner's own regex literal \u2014 /source(/ parses as a call. A JS tokeniser would fix it properly; one entry is cheaper than one.",
+      "until": "2026-12-31"
+    }
+  ]
+}
