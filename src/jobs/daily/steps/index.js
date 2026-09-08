@@ -1,3 +1,21 @@
+/**
+ * ─── INERT, AND NOW UNRUNNABLE ─────────────────────────────────────────────
+ *
+ * These steps computed spread.symbol_day and spread.market_day, which are now
+ * VIEWS over public.* that the SCRAPER computes — so every UPDATE here would
+ * fail on a view it cannot write.
+ *
+ * They also read spread.symbol, which migration 015 dropped as an empty
+ * duplicate of public.instruments. So this file will throw on line 467 if
+ * anyone runs it.
+ *
+ * NOT REPAIRED, deliberately: repairing it would make it runnable, and running
+ * it would recreate the two-analytics-layers problem the schema boundary
+ * exists to prevent. If a measurement is missing, add it to the scraper's
+ * compute — five columns came across that way rather than being recomputed
+ * here.
+ */
+
 'use strict';
 /**
  * ============================================================================
@@ -23,9 +41,12 @@
  * ============================================================================
  */
 
-const { GATES, QUALITY, BUDGET, DEPTH } = require('../../../config/spread.config');
+const { GATES, QUALITY, DEPTH } = require('../../../config/spread.config');
+const gateStore = require('../../../services/gateStore');
 
-const K = "AT TIME ZONE 'UTC' + interval '3 hours'";
+// Kuwait WALL CLOCK, for hour-of-day only. The session DAY is never derived
+// from this: that is spread.kuwait_day() (019), which rolls at 04:00.
+const K = "AT TIME ZONE 'Asia/Kuwait'";
 
 /*
  * The RAW source table, resolved at runtime.
@@ -59,7 +80,7 @@ async function build(day, db) {
               trades::bigint AS trd, bid::numeric AS bid, offer::numeric AS ofr,
               created_at
          FROM spread.v_quote_screening
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
      ), agg AS (
        SELECT symbol, max(market) AS market,
               count(*) AS ticks,
@@ -83,7 +104,7 @@ async function build(day, db) {
               volume::bigint AS vol_full,
               trades::bigint AS trd_full
          FROM spread.v_quote
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
         ORDER BY symbol, created_at DESC
      )
      INSERT INTO spread.symbol_day
@@ -177,7 +198,19 @@ async function baselines(day, db) {
  * gates — moves, tape quality, postable, exitable
  * ========================================================================*/
 async function gates(day, db) {
-  const slot = BUDGET.slotKd;
+  // A2 · the band edges size against the operator's set budget (spread.gate_config
+  // session-budget), the SAME source as the live screen — never the file seed.
+  // A batch process may not have loaded the store at boot; load it, and refuse
+  // loudly rather than compute a band off a number nobody set (on a 2,000 account
+  // the 790 seed would place the queue band at a third of the real level).
+  await gateStore.load(db).catch(() => {});
+  const slot = gateStore.sessionBudgetKd();
+  if (slot == null) {
+    throw new Error(
+      'daily gates: no session budget is set (spread.gate_config session-budget) — '
+      + 'refusing to compute the queue band off the file seed. '
+      + 'Set it with PUT /gates {"session-budget": 2000}.');
+  }
   const [qLo, qHi] = GATES.queueBandPct;
   // The band edges in KD: your order must be qLo..qHi percent of the level.
   const minLevelKd = slot / (qHi / 100);
@@ -193,7 +226,7 @@ async function gates(day, db) {
               lag(last_price::numeric) OVER w AS prev_px,
               lag(volume::bigint)      OVER w AS prev_vol
          FROM spread.v_quote_screening
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
        WINDOW w AS (PARTITION BY symbol ORDER BY created_at)
      ), moved AS (
        SELECT *, (px <> prev_px) AS is_move,
@@ -308,7 +341,7 @@ async function flow(day, db) {
               last_price::numeric AS px, last_qty::bigint AS one_trade,
               bid::numeric AS bid, offer::numeric AS ofr
          FROM spread.v_quote_screening
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
           AND last_qty IS NOT NULL AND bid > 0 AND offer > 0
      ), f AS (
        SELECT symbol,
@@ -374,7 +407,7 @@ async function hours(day, db) {
               EXTRACT(hour FROM created_at ${K})::int AS hr,
               max(trades::bigint) - min(trades::bigint) AS n
          FROM spread.v_quote_screening
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
         GROUP BY symbol, hr
      ), p AS (
        SELECT symbol,
@@ -514,14 +547,14 @@ async function coverage(day, db) {
     `WITH best AS (
        SELECT symbol, count(*) AS ticks
          FROM spread.v_quote_screening
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
         GROUP BY symbol ORDER BY ticks DESC LIMIT 1
      ), gaps AS (
        -- OBSERVED, not configured. A configured interval drifts from reality
        -- and an observed one cannot.
        SELECT EXTRACT(EPOCH FROM (created_at - lag(created_at) OVER (ORDER BY created_at))) AS g
          FROM spread.v_quote_screening
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
           AND symbol = (SELECT symbol FROM best)
      )
      SELECT (SELECT ticks FROM best) AS session_max,
@@ -549,7 +582,9 @@ async function coverage(day, db) {
   if (flag !== 'OK') {
     await db.query(
       `INSERT INTO spread.data_alarm (trading_day, table_name, alarm, detail)
-       VALUES ($1, 'stock_quotes', 'LOW_COVERAGE', $2);`,
+       VALUES ($1, 'stock_quotes', 'LOW_COVERAGE', $2)
+       ON CONFLICT (table_name, alarm, COALESCE(trading_day, '0001-01-01'::date),
+                    COALESCE(column_name, ''), COALESCE(symbol, '')) WHERE resolved_at IS NULL DO NOTHING;`,
       [day, JSON.stringify({ flag, maxTicks, expected, medianGap,
         note: 'every per-symbol coverage figure today is measured against a maximum that is itself degraded' })]);
   }
@@ -644,13 +679,15 @@ async function alarms(day, db) {
   const { rows: nulls } = await db.query(
     `SELECT symbol, count(*) AS n
        FROM public.stock_quotes
-      WHERE (created_at ${K})::date = $1
+      WHERE spread.kuwait_day(created_at) = $1
       GROUP BY symbol
      HAVING count(*) FILTER (WHERE session IS NOT NULL) = 0;`, [day]);
   for (const r of nulls) {
     await db.query(
       `INSERT INTO spread.data_alarm (trading_day, table_name, column_name, symbol, alarm, detail)
-       VALUES ($1,'stock_quotes','session',$2,'ALL_NULL',$3);`,
+       VALUES ($1,'stock_quotes','session',$2,'ALL_NULL',$3)
+       ON CONFLICT (table_name, alarm, COALESCE(trading_day, '0001-01-01'::date),
+                    COALESCE(column_name, ''), COALESCE(symbol, '')) WHERE resolved_at IS NULL DO NOTHING;`,
       [day, r.symbol, JSON.stringify({ rows: Number(r.n),
         note: 'every query filtering session = Trading drops this symbol silently' })]);
     raised.push({ symbol: r.symbol, alarm: 'ALL_NULL' });
@@ -661,13 +698,15 @@ async function alarms(day, db) {
     `SELECT w.symbol, count(d.*) AS snapshots
        FROM spread.depth_watchlist w
        LEFT JOIN spread.v_depth d
-         ON d.symbol = w.symbol AND (d.created_at ${K})::date = w.trading_day
+         ON d.symbol = w.symbol AND spread.kuwait_day(d.created_at) = w.trading_day
       WHERE w.trading_day = $1
       GROUP BY w.symbol HAVING count(d.*) < $2;`, [day, DEPTH.minSnapshots]);
   for (const r of thin) {
     await db.query(
       `INSERT INTO spread.data_alarm (trading_day, table_name, symbol, alarm, detail)
-       VALUES ($1,'stock_depth',$2,'LOW_COVERAGE',$3);`,
+       VALUES ($1,'stock_depth',$2,'LOW_COVERAGE',$3)
+       ON CONFLICT (table_name, alarm, COALESCE(trading_day, '0001-01-01'::date),
+                    COALESCE(column_name, ''), COALESCE(symbol, '')) WHERE resolved_at IS NULL DO NOTHING;`,
       [day, r.symbol, JSON.stringify({ snapshots: Number(r.snapshots),
         needed: DEPTH.minSnapshots,
         note: 'a depth-direction claim below this sample size is refused' })]);
@@ -682,7 +721,9 @@ async function alarms(day, db) {
   for (const r of gone) {
     await db.query(
       `INSERT INTO spread.data_alarm (trading_day, table_name, symbol, alarm, detail)
-       VALUES ($1,'symbol',$2,'SYMBOL_VANISHED',$3);`,
+       VALUES ($1,'symbol',$2,'SYMBOL_VANISHED',$3)
+       ON CONFLICT (table_name, alarm, COALESCE(trading_day, '0001-01-01'::date),
+                    COALESCE(column_name, ''), COALESCE(symbol, '')) WHERE resolved_at IS NULL DO NOTHING;`,
       [day, r.symbol, JSON.stringify({
         note: 'absent for five sessions — a vanished symbol looks identical to a quiet one' })]);
     raised.push({ symbol: r.symbol, alarm: 'SYMBOL_VANISHED' });

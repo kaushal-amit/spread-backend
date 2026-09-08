@@ -123,4 +123,66 @@ async function closeWindow(alertId, { db = pool, now = new Date() } = {}) {
       WHERE id = $1 AND window_closed_at IS NULL;`, [alertId, now]);
 }
 
-module.exports = { evaluate, fire, closeWindow, cooldown };
+/**
+ * ── E5 · stranded orders, straight from order_leg (Step 3.2 / B-06) ────────
+ *
+ * The check used to walk contracts() — which is built from OPEN BUYS, so a
+ * contract whose buy is still POSTED had no entry and the leg was never seen.
+ * That is exactly the 29 July order: posted at 238, correct when placed, one
+ * level below the bid five minutes later, filled as price fell through.
+ *
+ * And contracts() marks a position at ENTRY when there is no quote today, so
+ * the rule was comparing the order against a number the order itself
+ * supplied. A quote is never fabricated here: no quote for the day means the
+ * symbol is counted in `notComputed` and nothing is emitted.
+ */
+async function stranded(day, { db = pool } = {}) {
+  /*
+   * R-03 · TODAY's resting orders, and resting sells on a contract that is
+   * still open. A leg posted on an earlier session and never resolved is not
+   * resting in the market — it was cancelled in Awsat and never recorded —
+   * and judging it against today's quote every tick, then announcing it as
+   * "not checked" every ten minutes, is noise that hides the real alert. Such
+   * legs are returned separately as `stale`, once, so they get resolved.
+   */
+  const { rows: legs } = await db.query(
+    `SELECT l.id, l.symbol, l.contract_seq, l.side, l.price_fils, l.shares, l.posted_at, l.trading_day,
+            (l.trading_day = $1::date
+             OR EXISTS (SELECT 1 FROM spread.order_leg b
+                         WHERE b.symbol = l.symbol AND b.contract_seq = l.contract_seq
+                           AND b.side = 'BUY' AND b.status IN ('FILLED','CARRIED'))) AS live
+       FROM spread.order_leg l
+      WHERE l.status = 'POSTED'
+      ORDER BY l.symbol, l.posted_at;`, [day]);
+  const rules = require('../lib/orderRules');
+  const { latestQuote } = require('../api/positions');
+  const quotes = new Map();
+  const alerts = [], notComputed = [], stale = [];
+  for (const l of legs) {
+    if (!l.live) {
+      stale.push({ legId: l.id, symbol: l.symbol, side: l.side, priceFils: Number(l.price_fils), postedDay: String(l.trading_day).slice(0, 10) });
+      continue;
+    }
+    if (!quotes.has(l.symbol)) quotes.set(l.symbol, await latestQuote(l.symbol, day, db));
+    const q = quotes.get(l.symbol);
+    if (!q || q.bid == null) {
+      if (!notComputed.includes(l.symbol)) notComputed.push(l.symbol);
+      continue;
+    }
+    const minutesResting = l.posted_at ? Math.max(0, Math.round((Date.now() - new Date(l.posted_at)) / 60000)) : 0;
+    const st = rules.checkStranded({
+      side: l.side, orderPriceFils: Number(l.price_fils),
+      bidFils: Number(q.bid), offerFils: q.offer == null ? null : Number(q.offer),
+      minutesResting,
+    });
+    if (st.stranded) {
+      alerts.push({ symbol: l.symbol, legId: l.id, side: l.side, code: st.code,
+        priceFils: Number(l.price_fils), bidFils: Number(q.bid),
+        offerFils: q.offer == null ? null : Number(q.offer),
+        quoteAt: q.created_at, message: st.message, options: st.options || [] });
+    }
+  }
+  return { alerts, notComputed, stale };
+}
+
+module.exports = { evaluate, fire, closeWindow, cooldown, stranded };

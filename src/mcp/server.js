@@ -19,10 +19,37 @@
 const readline = require('readline');
 const { Pool } = require('pg');
 
+/*
+ * S-05 · READ-ONLY IS A ROLE, NOT A REGEX.
+ *
+ * This fell back to DATABASE_URL — the read-write role — and the regex
+ * allowlist below is bypassable by any function that runs SQL
+ * (query_to_xml, dblink, pg_read_file). With the RW role that was a write
+ * path. The server now refuses to start without a connection string of its
+ * own, and every session is forced read-only at the Postgres level, so even
+ * a bypass of the regex cannot write.
+ *
+ *   CREATE ROLE ai_ro LOGIN PASSWORD '…';
+ *   GRANT USAGE ON SCHEMA spread, public TO ai_ro;
+ *   GRANT SELECT ON ALL TABLES IN SCHEMA spread, public TO ai_ro;
+ *   REVOKE SELECT ON spread.cash_movement FROM ai_ro;
+ *   MCP_DATABASE_URL=postgres://ai_ro:…@host/kse
+ */
+if (!process.env.MCP_DATABASE_URL) {
+  process.stderr.write('mcp/server: MCP_DATABASE_URL (the ai_ro role) is required; refusing to fall back to DATABASE_URL\n');
+  process.exit(2);
+}
+if (/^postgres(ql)?:\/\/[^:]*(postgres|spread|admin)[:@]/i.test(process.env.MCP_DATABASE_URL)) {
+  process.stderr.write('mcp/server: MCP_DATABASE_URL names a read-write role; use ai_ro\n');
+  process.exit(2);
+}
 const pool = new Pool({
-  connectionString: process.env.MCP_DATABASE_URL || process.env.DATABASE_URL,
+  connectionString: process.env.MCP_DATABASE_URL,
   max: 4,
   statement_timeout: 15000,
+});
+pool.on('connect', (client) => {
+  client.query('SET default_transaction_read_only = on; SET search_path = spread, public;').catch(() => {});
 });
 
 const ALLOWED = /^\s*select\b/i;
@@ -98,7 +125,7 @@ async function runTool(name, args = {}) {
     const { rows } = await pool.query(
       `SELECT * FROM spread.v_depth
         WHERE upper(symbol) = upper($1)
-          AND (created_at AT TIME ZONE 'UTC' + interval '3 hours')::date = $2
+          AND spread.kuwait_day(created_at) = $2
         ORDER BY created_at;`, [args.symbol, args.date]);
     return { snapshots: rows.length, sufficientForDirection: rows.length >= 100, rows };
   }

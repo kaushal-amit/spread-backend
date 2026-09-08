@@ -16,7 +16,6 @@
 const { pool } = require('../db');
 const { toDay } = require('../lib/day');
 
-const K = "AT TIME ZONE 'UTC' + interval '3 hours'";
 
 /**
  * Order history, GROUPED INTO CONTRACTS.
@@ -30,26 +29,41 @@ const K = "AT TIME ZONE 'UTC' + interval '3 hours'";
  */
 /** ISO or nothing. A malformed date reaching `$1::date` throws a 503 that
  *  reads like the engine is down. */
-const isoDay = (v) => {
-  if (v == null || v === '') return null;
-  const t = String(v).trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) {
-    const e = new Error(`"${t}" is not a date`);
-    e.status = 400; e.code = 'BAD_REQUEST';
-    e.detail = 'expected YYYY-MM-DD';
-    throw e;
-  }
-  return t;
-};
+// B-14 · an ApiError, so errors.js answers 400 rather than 500.
+const isoDay = (v) => (v == null || v === '' ? null : require('./params').dayParam(v));
 
-async function orders({ from = null, to = null, db = pool } = {}) {
+async function orders({ from = null, to = null, limit = 500, cursor = null, db = pool } = {}) {
   from = isoDay(from); to = isoDay(to);
+  limit = Math.min(Math.max(1, Number(limit) || 500), 500);
+  // 6.4 · the cursor is BY CONTRACT (R-01), keyed on the contract's newest leg
+  // (max posted_at, max id): the next page is the contracts older than it.
+  const curAt = cursor && cursor.at ? cursor.at : null;
+  const curId = cursor && cursor.id != null ? cursor.id : null;
+  /*
+   * R-01 · the limit is on CONTRACTS, never on legs. Limiting legs cut the
+   * newest contract in half — a sell with no buy — and the behaviour flags
+   * (exit moved down, stranded, fill rate) were computed on a torn sequence.
+   * The newest `limit` contracts (by their latest leg) are chosen first; every
+   * leg of each is then returned, oldest first.
+   */
   const { rows } = await db.query(
-    `SELECT l.*, COALESCE(l.carried_from_day, l.trading_day) AS contract_day
-       FROM spread.order_leg l
-      WHERE ($1::date IS NULL OR l.trading_day >= $1)
-        AND ($2::date IS NULL OR l.trading_day <= $2)
-      ORDER BY l.posted_at, l.id;`, [from, to]);
+    `WITH keyed AS (
+       SELECT l.*, COALESCE(l.carried_from_day, l.trading_day) AS contract_day
+         FROM spread.order_leg l
+        WHERE ($1::date IS NULL OR l.trading_day >= $1)
+          AND ($2::date IS NULL OR l.trading_day <= $2)
+     ), newest AS (
+       SELECT symbol, contract_day, contract_seq
+         FROM keyed
+        GROUP BY symbol, contract_day, contract_seq
+       HAVING ($4::timestamptz IS NULL
+               OR (max(posted_at), max(id)) < ($4::timestamptz, $5::bigint))
+        ORDER BY max(posted_at) DESC NULLS LAST, max(id) DESC
+        LIMIT $3
+     )
+     SELECT k.* FROM keyed k
+       JOIN newest n USING (symbol, contract_day, contract_seq)
+      ORDER BY k.posted_at, k.id;`, [from, to, limit, curAt, curId]);
 
   const byContract = new Map();
   for (const l of rows) {
@@ -148,6 +162,24 @@ async function orders({ from = null, to = null, db = pool } = {}) {
 
   out.sort((a, b) => (b.contractDay > a.contractDay ? 1 : b.contractDay < a.contractDay ? -1 : b.seq - a.seq));
 
+  // 6.4 · the next-page cursor: the least-recent contract returned, so the next
+  // page continues older than it. Computed from the RAW legs (byContract), which
+  // carry posted_at — the presented legs in `out` do not. Only on a full page.
+  const recencyOf = (key) => (byContract.get(key)?.legs || []).reduce((acc, l) => {
+    const at = l.posted_at ? new Date(l.posted_at).getTime() : 0;
+    const id = Number(l.id);
+    return (at > acc.at || (at === acc.at && id > acc.id)) ? { at, id, atIso: l.posted_at } : acc;
+  }, { at: -1, id: -1, atIso: null });
+  let next = null;
+  if (out.length >= limit && out.length) {
+    let oldest = null;
+    for (const c of out) {
+      const rr = recencyOf(c.key);
+      if (!oldest || rr.at < oldest.at || (rr.at === oldest.at && rr.id < oldest.id)) oldest = rr;
+    }
+    if (oldest && oldest.atIso) next = `${new Date(oldest.atIso).toISOString()}|${oldest.id}`;
+  }
+
   // The two counters nobody was measuring.
   const allLegs = rows.length;
   const fillsTotal = rows.filter((l) => l.status === 'FILLED').length;
@@ -157,6 +189,7 @@ async function orders({ from = null, to = null, db = pool } = {}) {
 
   return {
     contracts: out,
+    next,
     summary: {
       ordersPlaced: allLegs, fills: fillsTotal,
       // The only feedback the queue estimator ever gets.
@@ -174,45 +207,65 @@ async function orders({ from = null, to = null, db = pool } = {}) {
  * +16.95 and commission took 14.00 of it — four small trips are expensive, and
  * a net-only view hides that completely.
  */
-async function dailyPnl({ from = null, to = null, db = pool } = {}) {
+async function dailyPnl({ from = null, to = null, limit = 500, db = pool } = {}) {
   from = isoDay(from); to = isoDay(to);
+  limit = Math.min(Math.max(1, Number(limit) || 500), 500);
+  /*
+   * C-11 · BY CONTRACT, counted on the day it CLOSED.
+   *
+   * This grouped FILLED legs by COALESCE(carried_from_day, trading_day), and
+   * nothing writes carried_from_day — so a buy on day A and its sell on day B
+   * were two groups, and day B booked the whole sale as profit. The contract
+   * key is (symbol, contract_seq); its day is when the last sell filled.
+   */
   const { rows } = await db.query(
     `WITH legs AS (
-       SELECT COALESCE(carried_from_day, trading_day) AS day, symbol, contract_seq,
-              side, status, price_fils, COALESCE(filled_shares, shares) AS shares,
-              commission_kd
+       SELECT symbol, contract_seq, side, trading_day, price_fils,
+              COALESCE(filled_shares, shares) AS shares, COALESCE(commission_kd, 0) AS commission_kd
          FROM spread.order_leg
-        WHERE status = 'FILLED'
-          AND ($1::date IS NULL OR trading_day >= $1)
-          AND ($2::date IS NULL OR trading_day <= $2)
+        WHERE (side = 'BUY' AND status IN ('FILLED','CARRIED'))
+           OR (side = 'SELL' AND status = 'FILLED')
      ), contracts AS (
-       SELECT day, symbol, contract_seq,
+       SELECT symbol, contract_seq,
+              max(trading_day) FILTER (WHERE side = 'SELL') AS day,
+              sum(shares) FILTER (WHERE side = 'BUY')  AS bought,
+              sum(shares) FILTER (WHERE side = 'SELL') AS sold,
               sum(CASE WHEN side='SELL' THEN price_fils*shares/1000.0
                        ELSE -price_fils*shares/1000.0 END) AS gross_kd,
               sum(commission_kd) AS commission_kd,
-              count(*) AS fills,
-              count(*) FILTER (WHERE side='SELL') AS sells
-         FROM legs GROUP BY 1,2,3
+              count(*) AS fills
+         FROM legs GROUP BY 1, 2
      )
-     SELECT day, count(*) FILTER (WHERE sells > 0) AS trips,
-            sum(fills) AS fills,
-            array_agg(DISTINCT symbol) AS symbols,
-            round(sum(gross_kd)::numeric, 3) AS gross_kd,
-            round(sum(commission_kd)::numeric, 3) AS commission_kd,
-            round(sum(gross_kd - commission_kd)::numeric, 3) AS net_kd
-       FROM contracts
-      WHERE sells > 0
-      GROUP BY day ORDER BY day DESC;`, [from, to]);
+     , days AS (
+       SELECT day, count(*) AS trips,
+              sum(fills) AS fills,
+              array_agg(DISTINCT symbol) AS symbols,
+              round(sum(gross_kd)::numeric, 3) AS gross_kd,
+              round(sum(commission_kd)::numeric, 3) AS commission_kd,
+              round(sum(gross_kd - commission_kd)::numeric, 3) AS net_kd
+         FROM contracts
+        WHERE bought IS NOT NULL AND sold >= bought
+        GROUP BY day
+     )
+     -- R-02 · the running total is the ACCOUNT's, from the first closed
+     -- contract, computed over every day and only then cut to the window. It
+     -- used to be summed over the returned rows, so a from/to or a limit made
+     -- "cumulative" mean "since the start of this page".
+     , cum AS (
+       -- the window runs over EVERY day; the WHERE below only cuts the page
+       SELECT *, round(sum(net_kd) OVER (ORDER BY day)::numeric, 3) AS cumulative_kd FROM days
+     )
+     SELECT day, trips, fills, symbols, gross_kd, commission_kd, net_kd, cumulative_kd
+       FROM cum
+      WHERE ($1::date IS NULL OR day >= $1)
+        AND ($2::date IS NULL OR day <= $2)
+      ORDER BY day DESC LIMIT $3;`, [from, to, limit]);
 
-  let running = 0;
-  const days = rows.slice().reverse().map((r) => {
-    running += Number(r.net_kd);
-    return {
-      day: toDay(r.day), symbols: r.symbols, trips: Number(r.trips), fills: Number(r.fills),
-      grossKd: Number(r.gross_kd), commissionKd: Number(r.commission_kd),
-      netKd: Number(r.net_kd), cumulativeKd: Number(running.toFixed(3)),
-    };
-  }).reverse();
+  const days = rows.map((r) => ({
+    day: toDay(r.day), symbols: r.symbols, trips: Number(r.trips), fills: Number(r.fills),
+    grossKd: Number(r.gross_kd), commissionKd: Number(r.commission_kd),
+    netKd: Number(r.net_kd), cumulativeKd: Number(r.cumulative_kd),
+  }));
 
   const totalNet = days.reduce((a, d) => a + d.netKd, 0);
   const totalComm = days.reduce((a, d) => a + d.commissionKd, 0);
@@ -290,27 +343,51 @@ async function candles(symbol, { day = null, minutes = 5, db = pool } = {}) {
     };
   }
 
+  /*
+   * 3.4 / D-08 · buckets in timestamptz.
+   *
+   * This used to shift created_at to Kuwait wall-clock (a timestamp WITHOUT
+   * zone), take extract(epoch) of THAT — which reads it as UTC — and so
+   * labelled every candle three hours early. date_bin() bins the instant
+   * itself; the origin is a Kuwait midnight so a 5-minute grid lands on
+   * 09:00 Kuwait, and the bucket is emitted as the instant it is.
+   *
+   * Volume: the scraper's `volume` is the session's CUMULATIVE total. A
+   * bucket's volume is its last cumulative minus the previous bucket's last —
+   * max − lag(max) ACROSS buckets — never max − min inside one, which loses
+   * every print that fell between two captures and made Σ candles < day
+   * volume. The first bucket of a session is its cumulative total (the
+   * session starts from zero); the lag is partitioned by session day so a
+   * multi-day series never subtracts yesterday's close from today's open.
+   */
   const { rows } = await db.query(
     `WITH t AS (
-       SELECT (created_at ${K}) AS at, last_price::numeric AS px, volume::bigint AS vol
+       SELECT created_at AS at, spread.kuwait_day(created_at) AS day,
+              last_price::numeric AS px, volume::bigint AS vol
          FROM spread.v_quote_screening
         WHERE upper(symbol) = $1
-          AND ($2::date IS NULL OR (created_at ${K})::date = $2)
-        ORDER BY created_at
+          AND ($2::date IS NULL OR spread.kuwait_day(created_at) = $2)
      ), b AS (
-       SELECT to_timestamp(floor(extract(epoch FROM at) / ($3 * 60)) * ($3 * 60)) AS bucket,
-              px, vol,
-              row_number() OVER (PARTITION BY floor(extract(epoch FROM at) / ($3*60)) ORDER BY at)      AS first_rn,
-              row_number() OVER (PARTITION BY floor(extract(epoch FROM at) / ($3*60)) ORDER BY at DESC) AS last_rn
+       SELECT date_bin(($3::int * interval '1 minute'), at,
+                       timestamptz '2000-01-01 00:00:00 Asia/Kuwait') AS bucket,
+              day, px, vol,
+              row_number() OVER (PARTITION BY date_bin(($3::int * interval '1 minute'), at,
+                       timestamptz '2000-01-01 00:00:00 Asia/Kuwait') ORDER BY at)      AS first_rn,
+              row_number() OVER (PARTITION BY date_bin(($3::int * interval '1 minute'), at,
+                       timestamptz '2000-01-01 00:00:00 Asia/Kuwait') ORDER BY at DESC) AS last_rn
          FROM t
+     ), c AS (
+       SELECT bucket, day,
+              max(px) FILTER (WHERE first_rn = 1) AS open,
+              max(px)                             AS high,
+              min(px)                             AS low,
+              max(px) FILTER (WHERE last_rn = 1)  AS close,
+              max(vol)                            AS cum
+         FROM b GROUP BY bucket, day
      )
-     SELECT bucket,
-            max(px) FILTER (WHERE first_rn = 1) AS open,
-            max(px)                             AS high,
-            min(px)                             AS low,
-            max(px) FILTER (WHERE last_rn = 1)  AS close,
-            max(vol) - min(vol)                 AS volume
-       FROM b GROUP BY bucket ORDER BY bucket;`, [sym, day, mins]);
+     SELECT bucket, open, high, low, close,
+            cum - COALESCE(lag(cum) OVER (PARTITION BY day ORDER BY bucket), 0) AS volume
+       FROM c ORDER BY bucket;`, [sym, day, mins]);
 
   return {
     symbol: sym, intervalMinutes: mins, grain: 'intraday',

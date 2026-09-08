@@ -157,13 +157,21 @@ function suggestExitPrice({ avgCostFils, levels = [], sharesPerMin,
  * ORDER, so two positions means four orders and 1.00 KD of extra fee on a
  * strategy whose whole edge is 1-3 KD a trip.
  */
-function checkNewPosition({ openPositions = 0, maxPositions = 1 }) {
+/*
+ * R-13 · the slot and the fee band are not a rule in a string literal
+ * (BACKEND_spec §11). The caller supplies `slotKd` (from the gate store) and the
+ * two computed round-trip fees (from commission.js), so the message names the
+ * live numbers and the sentence survives the 1 October commission change.
+ */
+function checkNewPosition({ openPositions = 0, maxPositions = 1, slotKd = null, feeSingleKd = null, feeSplitKd = null }) {
   if (openPositions >= maxPositions) {
+    const cost = (slotKd != null && feeSingleKd != null && feeSplitKd != null)
+      ? `Splitting ${Math.round(slotKd)} KD into two halves raises commission from `
+        + `${feeSingleKd.toFixed(2)} to ${feeSplitKd.toFixed(2)} — the settlement fee is per order. `
+      : 'A second position doubles the order count, and the settlement fee is per order. ';
     return { allowed: false, code: 'POSITION_LIMIT',
-      message: `${openPositions} position${openPositions === 1 ? ' is' : 's are'} already open ` +
-               `and the limit is ${maxPositions}. Splitting 790 KD into two halves raises ` +
-               'commission from 3.40 to 4.40 and cuts net per fil by two thirds. ' +
-               'Close the open position first.' };
+      message: `${openPositions} position${openPositions === 1 ? ' is' : 's are'} already open `
+               + `and the limit is ${maxPositions}. ${cost}Close the open position first.` };
   }
   return { allowed: true, code: 'OK' };
 }
@@ -270,9 +278,9 @@ function checkHardExit({ hasPosition, now = new Date(), hardExitAt = EXIT.hardEx
 
   if (left > 0) return { due: false, minutesLeft: left };
   return { due: true, minutesLate: -left,
-    message: `${hardExitAt} has passed with a position still open. Never carry overnight — ` +
-             'every overnight hold in ten sessions lost money, the worst −44.94 over a weekend. ' +
-             'The auction is the exit if the offer will not lift.' };
+    message: `${hardExitAt} — flatten now, be flat by 12:45 (not into the auction). Never carry ` +
+             'overnight either — every overnight hold in ten sessions lost money, the worst −44.94 ' +
+             'over a weekend. Hit the bid if the offer will not lift; after 12:45 it is too late to trade.' };
 }
 
 module.exports = {

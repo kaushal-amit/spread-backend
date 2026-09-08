@@ -1,4 +1,12 @@
 'use strict';
+/*
+ * ─── KNOWN GAPS IN THE GATE SET (3 September 2026) ──────────────────────────
+ * ABAR passed every gate on 1 September and fell 24 fils on 2 September with
+ * buying prints at 1:2.5 against selling. No gate reads the PRINT-SIZE RATIO
+ * (avg_uptick_shares / avg_downtick_shares, both in symbol_day) or INTRADAY
+ * DIRECTION, so a stock being distributed can still read TRADABLE. Noted, not
+ * fixed: a new gate needs the ten-session sample before it gets a threshold.
+ */
 /**
  * ============================================================================
  *  spread.config.js — every threshold, with the evidence behind it
@@ -109,10 +117,17 @@ const ALERT = {
 };
 
 const EXIT = {
-  armAtTicks: 1,                   // at the first PROFITABLE tick, not break-even
-  trailTicks: 1,
+  // R-41 · the exit target IS the rule (FLOW step 7): +2 fils normally, +6 on
+  // a trending day. The prototype's trailing-offer arithmetic (armAtTicks,
+  // trailTicks) is gone — a trailing exit was never the rule and it competed
+  // with the target on the card.
+  targetNormalTicks: 2,            // +2 fils, the standing target — A1: now the kb row exit_target_normal_fils (this is the fallback default)
+  targetTrendingTicks: 6,          // +6 fils when the day is trending (RISK ON) — A1: kb row exit_target_trending_fils, stays 6
+  // A1 · when no target is hit, hold to flat_by_hhmm (12:45) rather than taking
+  // the first profitable tick. The kb row exit_hold_to_flat overrides this.
+  holdToFlatBy: true,
   stepDownAtClock: '11:00',        // three findings; drift turns negative at noon
-  hardExitAtClock: '12:30',
+  hardExitAtClock: '12:30',        // the WARNING; the flat-by RULE is 12:45 (kb_threshold flat_by_hhmm)
   neverCarryOvernight: true,
   maxFillEstMins: 30,
   warnFillEstMins: 15,

@@ -1,0 +1,45 @@
+/**
+ * R-38 · TODAY must say WHICH fix applies when a gate cannot be computed.
+ *   no quote for this symbol on this day  → a scraper / market question (noQuotes)
+ *   a quote present, no gate-stats source → "stats:daily has not run"   (noStats)
+ * The board carries the two counts so the browser words the line, not computes it.
+ */
+const { requireTestDb } = require('./dbguard');
+requireTestDb('boardcounts');
+const { pool } = require('../src/db');
+const fx = require('./fixtures').bind(pool);
+const screening = require('../src/services/screening');
+const { GATES } = require('../src/config/spread.config');
+
+let p = 0, n = 0;
+const chk = (t, c, x) => { n++; if (c) p++; else console.log('  FAIL', t, x === undefined ? '' : JSON.stringify(x)); };
+
+const DAY = fx.TEST_DAY;
+const NOQ = 'SZTESTNOQ', NOS = 'SZTESTNOS';
+
+(async () => {
+  try {
+    for (const s of [NOQ, NOS]) { await fx.clearQuotes(s); await fx.instrument(s); await fx.clearSymbolDay(s); }
+    // NOQ · a symbol_day row, no quote ever captured → quoteAt null.
+    await fx.symbolDay(NOQ, DAY, { close: 200 });
+    // NOS · a symbol_day row and a quote, but no bridge stats → gateStatsSource null.
+    await fx.symbolDay(NOS, DAY, { close: 200 });
+    await fx.quote(NOS, { day: DAY, at: `${DAY}T06:00:00Z`, last: 200, bid: 199, offer: 201 });
+
+    const b = await screening.screen(DAY, 2000, { cfg: GATES });
+    const all = [...b.recommended, ...b.nearMiss, ...b.rejected];
+    const noq = all.find((r) => r.symbol === NOQ);
+    const nos = all.find((r) => r.symbol === NOS);
+
+    console.log('\n=== R-38 · noQuotes vs noStats ===');
+    chk('a symbol with no quotes shows "no quotes" (quoteAt null)', noq && noq.quoteAt == null, noq && { quoteAt: noq.quoteAt });
+    chk('a symbol with a quote and no bridge shows "stats:daily has not run"', nos && nos.quoteAt != null && !nos.gateStatsSource, nos && { quoteAt: nos.quoteAt, src: nos.gateStatsSource });
+    chk('the board carries the two counts separately', typeof b.counts.noQuotes === 'number' && typeof b.counts.noStats === 'number' && b.counts.noQuotes >= 1 && b.counts.noStats >= 1, { noQuotes: b.counts.noQuotes, noStats: b.counts.noStats });
+  } catch (e) {
+    chk('the suite ran without throwing', false, e.stack?.split('\n').slice(0, 3).join(' | '));
+  }
+  for (const s of [NOQ, NOS]) { await fx.clearQuotes(s).catch(() => {}); await fx.clearSymbolDay(s).catch(() => {}); await fx.clearInstruments(s).catch(() => {}); }
+  await pool.end();
+  console.log(p === n ? `\nALL PASS  (${n} checks)` : `\nFAILURES: ${n - p}  (${n} checks)`);
+  process.exit(p === n ? 0 : 1);
+})();

@@ -16,7 +16,6 @@
 const { pool } = require('../db');
 const { toDay: day } = require('../lib/day');
 
-const K = "AT TIME ZONE 'UTC' + interval '3 hours'";
 
 async function check(db = pool) {
   const out = [];
@@ -45,9 +44,9 @@ async function check(db = pool) {
   const { rows: [q] } = await db.query(
     `SELECT count(*) AS rows,
             count(DISTINCT symbol) AS symbols,
-            count(DISTINCT (created_at ${K})::date) AS days,
-            min((created_at ${K})::date) AS oldest,
-            max((created_at ${K})::date) AS newest
+            count(DISTINCT spread.kuwait_day(created_at)) AS days,
+            min(spread.kuwait_day(created_at)) AS oldest,
+            max(spread.kuwait_day(created_at)) AS newest
        FROM ${source};`);
   const quoteRows = Number(q.rows);
   add('quotes', quoteRows > 0,
@@ -72,11 +71,15 @@ async function check(db = pool) {
       Number(cal.in_range) ? null : 'npm run calendar');
 
   // ---- 5 · symbols -------------------------------------------------------
-  const { rows: [sym] } = await db.query('SELECT count(*) AS n FROM spread.symbol;');
+  // public.instruments, not spread.symbol: that table was dropped as an empty
+  // duplicate, and the canonical list has 142 rows with is_primary and
+  // is_tradeable.
+  const { rows: [sym] } = await db.query(
+    'SELECT count(*) AS n FROM public.instruments WHERE is_primary;');
   const symbols = Number(sym.n);
   add('symbols', symbols > 0, `${symbols} registered`,
       symbols ? null
-        : 'spread.symbol is empty, so the `missing` step writes no rows and a scraper ' +
+        : 'public.instruments is empty, so the `missing` step writes no rows and a scraper ' +
           'failure stays invisible. Seed it: npm run seed:symbols');
 
   // ---- 6 · computed days -------------------------------------------------
@@ -108,7 +111,7 @@ async function check(db = pool) {
             count(DISTINCT capture_id) AS captures,
             count(DISTINCT symbol) AS symbols,
             count(*) FILTER (WHERE bid_qty IS NOT NULL AND offer_qty IS NOT NULL) AS usable
-       FROM spread.depth;`)
+       FROM spread.v_depth;`)
     .catch(() => ({ rows: [{ rows: 0, captures: 0, symbols: 0, usable: 0 }] }));
 
   const depthRows = Number(d.rows);

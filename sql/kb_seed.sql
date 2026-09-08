@@ -1,0 +1,35 @@
+-- sql/kb_seed.sql — the thirty thresholds, as read from public.kb_threshold on kse, 2 September 2026.
+-- 016 copies them from public.* where that table exists; this file is for a database without it.
+-- Idempotent: an existing key is left alone, so an operator's change is never overwritten.
+INSERT INTO spread.kb_threshold (key, value, unit, source_cr, note, still_true) VALUES
+  ('bid_age_bait_minutes', 5, 'minutes', 'CR-50', 'under this and large, it is bait', true),
+  ('bid_age_real_minutes', 30, 'minutes', 'CR-50', 'a level held this long is real support', true),
+  ('bid_bait_min_qty', 100000, 'shares', 'CR-50', NULL, true),
+  ('ceiling_presence_pct', 75, 'percent', 'CR-51', 'present this share of the session', true),
+  ('commission_min_kd', 0.5, 'KD', 'schedule', 'changes 1 October', true),
+  ('commission_rate', 0.0015, 'rate', 'schedule', 'changes 1 October', true),
+  ('exit_depth_max_x', 3, 'x', 'CR-54', 'offer_qty as a multiple of your size', true),
+  ('frozen_min_qty', 100000, 'shares', 'CR-68', 'both sides above this with zero volume', true),
+  ('max_price_fils', 333, 'fils', 'derived', 'above this one fil never clears commission at any size', true),
+  ('min_position_kd', 333, 'KD', 'derived', '0.50 KD minimum / 0.15% - below this the flat fee bites', true),
+  ('moves_min', 15, 'count', 'CR-39', NULL, true),
+  ('my_pct_max', 30, 'percent', 'CR-48', 'above this you ARE the level', true),
+  ('my_pct_min', 5, 'percent', 'CR-48', 'below this you are invisible in the queue', true),
+  ('no_protection_qty', 20000, 'shares', 'CR-37', 'touch bid below this = no protection', true),
+  ('parked_max_changes', 2, 'count', 'CR-50', NULL, true),
+  ('reserve_pct', 25, 'percent', 'CR-39', 'held back until 11:00', true),
+  ('reserve_release_hhmm', 1100, 'hhmm', 'CR-39', NULL, true),
+  ('sig_bait_max_age_secs', 300, 'seconds', 'CR-50', 'BAIT BID: large and younger than this', true),
+  ('sig_big_qty', 100000, 'shares', 'CR-68', 'FROZEN: both sides above this', true),
+  ('sig_buyers_ratio', 1.6, 'ratio', 'CR-41', 'BUYERS 8:5 fires at or above this WITH price rising', true),
+  ('sig_no_protection_bid', 20000, 'shares', 'CR-37', 'NO PROTECTION: touch bid below this', true),
+  ('sig_tiny_trade_shares', 100, 'shares', 'CR-40', 'a print at or below this is tiny', true),
+  ('sig_wall_qty', 200000, 'shares', 'CR-51', 'size at a level worth calling a wall', true),
+  ('snapshots_min', 100, 'count', 'chk', 'under this, no direction can be stated', true),
+  ('tick_min_price', 100, 'fils', 'CR-48', 'below 100 fils the tick is 0.1', true),
+  ('tiny_pct_max', 20, 'percent', 'CR-40', 'up-move tiny prints', true),
+  ('up2_min', 3, 'count', 'CR-39', NULL, true),
+  ('volume_vs_yesterday', 50, 'percent', 'CR-49', 'percent of the same hour yesterday', true),
+  ('wakeup_pace_min', 3, 'x', 'CR-46', 'trades today over the median for this hour', true),
+  ('wakeup_trades_min', 20, 'count', 'CR-46', 'below this the pace ratio is noise', true)
+ON CONFLICT (key) DO NOTHING;

@@ -8,20 +8,27 @@
     "migrate": "node src/db/migrate.js",
     "migrate:dry": "node src/db/migrate.js --dry-run",
     "calendar": "node src/db/seed-calendar.js",
-    "job:daily": "node src/jobs/daily/index.js",
+    "m45": "node scripts/m45.js",
+    "halts:backfill": "node scripts/halts-backfill.js",
     "lint:rules": "sh scripts/lint-rules.sh",
     "test": "node test/run.js",
     "verify": "npm run lint:rules && npm test",
     "start": "node src/index.js",
     "mcp": "node src/mcp/server.js",
     "doctor": "node src/db/doctor.js",
-    "seed:symbols": "node src/db/seed-symbols.js"
+    "legs:stale": "node src/db/legs-stale.js",
+    "stats:daily": "node src/jobs/stats/index.js",
+    "import:fills": "node src/jobs/import-fills.js",
+    "reconcile:fees": "node src/jobs/reconcile-fees.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "pg": "^8.13.1",
-    "pg-mem": "^3.0.14",
     "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "pg-mem": "^3.0.14",
+    "socket.io-client": "^4.8.3"
   }
 }

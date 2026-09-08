@@ -8,7 +8,7 @@ const C = require('../src/lib/commission');
 const R = require('../src/lib/orderRules');
 const D = require('../src/services/depth');
 const B = require('../src/services/ai/boundary');
-const REG = require('../src/services/ai/registry');
+const REG = require('../src/services/ai/tools');
 
 let pass = 0, fail = 0;
 const chk = (l, c, x = '') => { console.log(`  ${c ? 'OK  ' : 'FAIL'} ${l}${x ? '  ' + x : ''}`); c ? pass++ : fail++; };
@@ -155,7 +155,7 @@ console.log('\n=== THE AI BOUNDARY ===');
 }
 
 console.log('\n=== THE TOOL REGISTRY ===');
-chk('ten tools, frozen', REG.assertReady().length === 10);
+chk('eleven tools, frozen', REG.assertReady().length === 11);
 chk('the precedent record is data, not prose',
     REG.PRECEDENTS.some((p) => p.costKd === -44.94));
 chk('  including the inverted depth reading',

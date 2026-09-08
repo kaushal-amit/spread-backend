@@ -13,7 +13,6 @@ const { pool } = require('../db');
 const PRICING = require('../lib/pricing');
 const { QUALITY, EXIT, DEPTH } = require('../config/spread.config');
 
-const K = "AT TIME ZONE 'UTC' + interval '3 hours'";
 
 /**
  * 5.1 · estimated fill time.
@@ -95,7 +94,7 @@ async function wakeUpScan(tradingDay, { db = pool, cfg = WAKE, now = new Date() 
     `WITH today AS (
        SELECT symbol, max(trades::bigint) AS trades_so_far
          FROM spread.v_quote_screening
-        WHERE (created_at ${K})::date = $1
+        WHERE spread.kuwait_day(created_at) = $1
         GROUP BY symbol)
      SELECT t.symbol, t.trades_so_far, p.${col} AS baseline,
             round(t.trades_so_far::numeric / p.${col}, 2) AS pace_ratio,
@@ -142,7 +141,7 @@ async function aliveCheck(symbol, tradingDay, { db = pool, now = new Date() } = 
 
   const { rows: [t] } = await db.query(
     `SELECT max(trades::bigint) AS n FROM spread.v_quote_screening
-      WHERE upper(symbol) = $1 AND (created_at ${K})::date = $2;`, [sym, tradingDay]);
+      WHERE upper(symbol) = $1 AND spread.kuwait_day(created_at) = $2;`, [sym, tradingDay]);
 
   const baseline = Number(
     hour <= 9 ? p.median_trades_by_0930
@@ -224,7 +223,7 @@ async function tinyAtPrice(symbol, priceFils, tradingDay, { db = pool, tinyMax =
        SELECT created_at, last_price::numeric AS px, last_qty::bigint AS one_trade,
               lag(last_price::numeric) OVER (ORDER BY created_at) AS prev_px
          FROM spread.v_quote_screening
-        WHERE upper(symbol) = $1 AND (created_at ${K})::date = $2
+        WHERE upper(symbol) = $1 AND spread.kuwait_day(created_at) = $2
      ), moves AS (
        SELECT * FROM t WHERE prev_px IS NOT NULL AND px <> prev_px
      )

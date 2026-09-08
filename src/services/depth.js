@@ -27,8 +27,8 @@
 
 const { pool } = require('../db');
 const { DEPTH } = require('../config/spread.config');
+const P = require('./phrases');
 
-const K = "AT TIME ZONE 'UTC' + interval '3 hours'";
 
 /**
  * Classify one book snapshot.
@@ -78,15 +78,22 @@ async function signalFor(symbol, tradingDay, { db = pool, cfg = DEPTH } = {}) {
 
   // Level 1 is the touch — what the signal reads. captured_at is when the book
   // looked like this; created_at is when the row was written, ~0.3s later.
+  /*
+   * B-05 · the columns v_depth actually has.
+   *
+   * v_depth is `SELECT * FROM public.awsat_stock_depth` (010). Its day column
+   * is trading_date, not trading_day, and capture_id existed only on the
+   * dropped spread.depth. Both raised 42703 on every call; alerts.js swallowed
+   * it, /live/depth answered 503, and the AI's depth tool failed — three
+   * symptoms, one wrong name.
+   */
   const { rows: [snap] } = await db.query(
     `SELECT bid::numeric AS bid_fils, bid_qty::bigint AS bid_shares,
             offer::numeric AS offer_fils, offer_qty::bigint AS offer_shares,
-            COALESCE(captured_at, created_at) AS at
-       FROM spread.depth
-      WHERE upper(symbol) = $1
-        AND COALESCE(trading_day, (COALESCE(captured_at, created_at) ${K})::date) = $2
-        AND level = 1
-      ORDER BY COALESCE(captured_at, created_at) DESC LIMIT 1;`, [sym, tradingDay]);
+            captured_at AS at
+       FROM spread.v_depth
+      WHERE symbol = $1 AND trading_date = $2 AND level = 1
+      ORDER BY captured_at DESC LIMIT 1;`, [sym, tradingDay]);
 
   /*
    * COUNT CAPTURES, NOT ROWS.
@@ -99,18 +106,15 @@ async function signalFor(symbol, tradingDay, { db = pool, cfg = DEPTH } = {}) {
    * Falls back to counting level-1 rows when capture_id is absent, which is
    * still per-capture rather than per-row.
    */
+  // One capture = one captured_at instant carrying ten levels.
   const { rows: [n] } = await db.query(
-    `SELECT count(DISTINCT COALESCE(capture_id,
-              (COALESCE(captured_at, created_at))::text)) AS snapshots,
-            count(*) AS rows
-       FROM spread.depth
-      WHERE upper(symbol) = $1
-        AND COALESCE(trading_day, (COALESCE(captured_at, created_at) ${K})::date) = $2;`,
-    [sym, tradingDay]);
+    `SELECT count(DISTINCT captured_at) AS snapshots, count(*) AS rows
+       FROM spread.v_depth
+      WHERE symbol = $1 AND trading_date = $2;`, [sym, tradingDay]);
 
   const { rows: [p] } = await db.query(
     `SELECT deep_bid_shares, thin_bid_shares, thin_offer_shares, wall_offer_shares
-       FROM spread.symbol_profile WHERE upper(symbol) = $1;`, [sym]);
+       FROM spread.symbol_profile WHERE symbol = $1;`, [sym]);
 
   const snapshots = Number(n?.snapshots || 0);
   const depthRows = Number(n?.rows || 0);
@@ -191,4 +195,239 @@ async function validate(symbol, tradingDay, { db = pool } = {}) {
   };
 }
 
-module.exports = { classify, signalFor, record, validate };
+/**
+ * R-26 · the last price MOVE and whether it was PAINTED (FLOW step 4 check 3).
+ * The most recent capture whose last_price differs from the prior capture's,
+ * with the print size that carried it; painted = that print is under
+ * paint_max_shares. A marker beside the BOOK row, never a gate. Null when no
+ * move is in the day's history yet.
+ */
+async function lastMove(symbol, tradingDay, { db = pool, now = null } = {}) {
+  const sym = String(symbol || '').toUpperCase();
+  const t = await require('../api/sizing').thresholds().catch(() => ({}));
+  const paintMax = Number(t.paint_max_shares ?? 100);
+  const { rows: [r] } = await db.query(
+    `WITH q AS (
+       SELECT created_at, last_price::numeric AS px, last_qty::bigint AS qty,
+              lag(last_price::numeric) OVER (ORDER BY created_at) AS prev
+         FROM public.awsat_market_quotes
+        WHERE upper(symbol) = $1 AND trading_date = $2::date AND last_price IS NOT NULL
+          AND ($3::timestamptz IS NULL OR created_at <= $3)
+     )
+     SELECT px, qty, created_at FROM q
+      WHERE prev IS NOT NULL AND px <> prev
+      ORDER BY created_at DESC LIMIT 1;`, [sym, tradingDay, now]);
+  if (!r) return null;
+  const qty = r.qty == null ? null : Number(r.qty);
+  return { priceFils: Number(r.px), qty, painted: qty != null && qty < paintMax,
+    at: new Date(r.created_at).toISOString(), paintMaxShares: paintMax };
+}
+
+module.exports = { classify, signalFor, record, validate, bookAges, stopFor, ladder, lastMove };
+
+/**
+ * ── BID AGE, from the capture history (R-23) ────────────────────────────────
+ *
+ * A bid level ages by PRICE: the bid at 158 is "aged 30m" if 158 has been
+ * present in the bid book continuously for 30 minutes. FLOW step 5 sizes from
+ * the aged bid (real support, not bait) and stops one fil below the nearest
+ * aged level. SHUAIBA on 1 September had no bid at all between 284 and 280; a
+ * stop at 283 from the touch would have filled four fils lower.
+ *
+ * Returns, for the LATEST capture of the day:
+ *   bids   [{ price, qty, ageMins, aged, bait }]   deepest-first (touch first)
+ *   gaps   [{ from, to, fils }]   adjacent bid levels more than one fil apart
+ *   touch  the level-1 bid
+ * ageMins is minutes from the FIRST capture in which this price was present in
+ * the bid book (any level), walking back only while it stays present — a price
+ * that vanished and came back ages from its return.
+ */
+async function bookAges(symbol, tradingDay, { db = pool, now = null } = {}) {
+  const sym = String(symbol || '').toUpperCase();
+  const { rows } = await db.query(
+    `SELECT captured_at, level, bid::numeric AS bid, bid_qty::bigint AS bid_qty
+       FROM spread.v_depth
+      WHERE upper(symbol) = $1 AND spread.kuwait_day(captured_at) = $2::date AND bid IS NOT NULL
+      ORDER BY captured_at, level;`, [sym, tradingDay]);
+  if (!rows.length) return { symbol: sym, capturedAt: null, bids: [], gaps: [], touch: null, captures: 0 };
+
+  // Group captures by instant; each is the bid book at that moment.
+  const byCapture = new Map();
+  for (const r of rows) {
+    const k = String(r.captured_at);
+    if (!byCapture.has(k)) byCapture.set(k, { at: new Date(r.captured_at), prices: new Map() });
+    byCapture.get(k).prices.set(Number(r.bid), Number(r.bid_qty));
+  }
+  const captures = [...byCapture.values()].sort((a, b) => a.at - b.at);
+  const latest = captures[captures.length - 1];
+  const nowMs = (now ? new Date(now) : latest.at).getTime();
+
+  // For each price present in the latest book, walk BACK while it stays present.
+  const ageMinsOf = (price) => {
+    let firstAt = latest.at;
+    for (let i = captures.length - 1; i >= 0; i--) {
+      if (captures[i].prices.has(price)) firstAt = captures[i].at;
+      else break;
+    }
+    return Math.round((nowMs - firstAt.getTime()) / 60000);
+  };
+
+  const t = await require('../api/sizing').thresholds().catch(() => ({}));
+  const realMin = Number(t.bid_age_real_minutes ?? 30);
+  const baitMin = Number(t.bid_age_bait_minutes ?? 5);
+  const baitQty = Number(t.bid_bait_min_qty ?? 100000);
+
+  const prices = [...latest.prices.entries()].map(([price, qty]) => {
+    const ageMins = ageMinsOf(price);
+    return { price, qty, ageMins, aged: ageMins >= realMin, bait: ageMins < baitMin && qty >= baitQty };
+  }).sort((a, b) => b.price - a.price); // touch (highest bid) first
+
+  const gaps = [];
+  for (let i = 0; i < prices.length - 1; i++) {
+    const fils = Number((prices[i].price - prices[i + 1].price).toFixed(3));
+    if (fils > 1) gaps.push({ from: prices[i].price, to: prices[i + 1].price, fils });
+  }
+  return { symbol: sym, capturedAt: new Date(latest.at).toISOString(), captures: captures.length, bids: prices, gaps, touch: prices[0] || null };
+}
+
+/**
+ * ── THE STOP (R-22) ─────────────────────────────────────────────────────────
+ * One fil below the nearest bid level, at or below `entryFils`, that has aged
+ * >= bid_age_real_minutes. Never on a round number (multiple of
+ * stop_round_number_fils — the catch bid waits there): step one more fil down
+ * and say so. If the ladder shows a gap between the entry and the shelf, warn —
+ * the stop may fill lower. No aged shelf below the entry -> no stop, and say
+ * why rather than inventing one from the touch.
+ */
+async function stopFor(symbol, tradingDay, entryFils, { db = pool, now = null } = {}) {
+  const t = await require('../api/sizing').thresholds().catch(() => ({}));
+  const roundFils = Number(t.stop_round_number_fils ?? 10);
+  const book = await bookAges(symbol, tradingDay, { db, now });
+  const entry = Number(entryFils);
+  const agedBelow = book.bids.filter((b) => b.aged && b.price <= entry).sort((a, b) => b.price - a.price);
+  if (!agedBelow.length) {
+    return { symbol: book.symbol, stopFils: null, shelfFils: null, capturedAt: book.capturedAt,
+      reason: book.captures === 0 ? 'no depth captured for this symbol — no stop can be placed'
+        : `no bid level at or below ${entry} has aged ${Number(t.bid_age_real_minutes ?? 30)} minutes — no real shelf to stop under`,
+      gap: null };
+  }
+  const shelf = agedBelow[0];
+  let stop = shelf.price - 1;
+  let steppedForRound = false;
+  // Never on a round number — step one more fil down.
+  while (stop > 0 && stop % roundFils === 0) { stop -= 1; steppedForRound = true; }
+  // A gap between the entry and the shelf: the stop may fill below itself.
+  const gap = book.gaps.find((g) => g.from <= entry && g.to >= shelf.price - g.fils) ||
+    book.gaps.find((g) => g.from > shelf.price && g.to < entry) || null;
+  const notes = [];
+  notes.push(`one fil below the ${shelf.price} shelf (held ${shelf.ageMins}m, ${shelf.qty.toLocaleString('en-US')} shares)`);
+  if (steppedForRound) notes.push(`stepped off the round number ${shelf.price - 1}`);
+  if (gap) notes.push(`GAP ${gap.from}→${gap.to} in the ladder — the stop may fill ${gap.fils} fil(s) lower`);
+  return { symbol: book.symbol, stopFils: stop, shelfFils: shelf.price, shelfAgeMins: shelf.ageMins,
+    shelfQty: shelf.qty, capturedAt: book.capturedAt, steppedForRound, gap, reason: notes.join('; ') };
+}
+
+/**
+ * ── LADDER MARKERS (R-24) ───────────────────────────────────────────────────
+ * The markers that turn a ladder into a read, computed DETERMINISTICALLY over
+ * the day's capture history for the LATEST book. The label text comes from
+ * spread.kb_phrase (services/phrases.js); the DECISION is here. Never a model
+ * call — 20 rows every 15 seconds is 80 calls a minute.
+ *
+ *   BID rows (touch = highest first)
+ *     BAIT     younger than bid_age_bait_minutes AND >= bid_bait_min_qty
+ *     AGED     held >= bid_age_real_minutes (real support)
+ *     NOPROT   the touch, below no_protection_qty — nothing beneath you
+ *     CATCH    an AGED bid sitting ON a round number — the operator's chosen price
+ *     SHELF    a round-number level that is not a catch bid — where stops cluster
+ *   OFFER rows (touch = lowest first)
+ *     CEILING  present >= ceiling_presence_pct of the session's captures
+ *     UNDERCUT the touch, fresh, sitting below an AGED offer above it — a seller
+ *              stepping in front of the established queue ({n} = the price undercut)
+ *     SHELF    a round-number offer level
+ *
+ * The flow-delta labels (PLACED, PULLED, RELOCATED, PARKED, THIN) are seeded in
+ * kb_phrase but not emitted here yet — they need per-order change tracking
+ * across captures, a separate piece.
+ *
+ * ageMins walks back while a price stays continuously present (same rule as
+ * bookAges); presencePct counts every capture the price appears in.
+ */
+async function ladder(symbol, tradingDay, { db = pool, now = null } = {}) {
+  const sym = String(symbol || '').toUpperCase();
+  const { rows } = await db.query(
+    `SELECT captured_at, level, bid::numeric AS bid, bid_qty::bigint AS bid_qty,
+            offer::numeric AS offer, offer_qty::bigint AS offer_qty
+       FROM spread.v_depth
+      WHERE upper(symbol) = $1 AND spread.kuwait_day(captured_at) = $2::date
+      ORDER BY captured_at, level;`, [sym, tradingDay]);
+  if (!rows.length) return { symbol: sym, capturedAt: null, captures: 0, bids: [], offers: [] };
+
+  const capMap = new Map();
+  for (const r of rows) {
+    const k = String(r.captured_at);
+    if (!capMap.has(k)) capMap.set(k, { at: new Date(r.captured_at), bid: new Map(), offer: new Map() });
+    const c = capMap.get(k);
+    if (r.bid != null) c.bid.set(Number(r.bid), Number(r.bid_qty));
+    if (r.offer != null) c.offer.set(Number(r.offer), Number(r.offer_qty));
+  }
+  const captures = [...capMap.values()].sort((a, b) => a.at - b.at);
+  const latest = captures[captures.length - 1];
+  const nowMs = (now ? new Date(now) : latest.at).getTime();
+  const totalCaps = captures.length;
+
+  const t = await require('../api/sizing').thresholds().catch(() => ({}));
+  const realMin = Number(t.bid_age_real_minutes ?? 30);
+  const baitMin = Number(t.bid_age_bait_minutes ?? 5);
+  const baitQty = Number(t.bid_bait_min_qty ?? 100000);
+  const roundFils = Number(t.stop_round_number_fils ?? 10);
+  const noProtQty = Number(t.no_protection_qty ?? 20000);
+  const ceilingPct = Number(t.ceiling_presence_pct ?? 75);
+
+  const ageMinsOf = (side, price) => {
+    let firstAt = latest.at;
+    for (let i = captures.length - 1; i >= 0; i--) {
+      if (captures[i][side].has(price)) firstAt = captures[i].at; else break;
+    }
+    return Math.round((nowMs - firstAt.getTime()) / 60000);
+  };
+  const presencePctOf = (side, price) => {
+    let seen = 0;
+    for (const c of captures) if (c[side].has(price)) seen += 1;
+    return totalCaps ? Math.round((100 * seen) / totalCaps) : 0;
+  };
+  const isRound = (price) => roundFils > 0 && price % roundFils === 0;
+  const fmt = (q) => Number(q).toLocaleString('en-US');
+
+  const bids = [...latest.bid.entries()].map(([price, qty]) => ({ price, qty }))
+    .sort((a, b) => b.price - a.price)
+    .map((row, i) => {
+      const ageMins = ageMinsOf('bid', row.price);
+      const aged = ageMins >= realMin;
+      const bait = ageMins < baitMin && row.qty >= baitQty;
+      const markers = [];
+      if (bait) markers.push(P.marker('BAIT', { n: ageMins }));
+      if (aged) markers.push(P.marker('AGED', { n: ageMins }));
+      if (i === 0 && row.qty < noProtQty) markers.push(P.marker('NOPROT', { n: fmt(row.qty) }));
+      if (isRound(row.price)) markers.push(aged ? P.marker('CATCH') : P.marker('SHELF'));
+      return { price: row.price, qty: row.qty, ageMins, aged, bait, markers };
+    });
+
+  const offerAges = [...latest.offer.entries()].map(([price, qty]) => ({ price, qty }))
+    .sort((a, b) => a.price - b.price)
+    .map((row) => ({ ...row, ageMins: ageMinsOf('offer', row.price), presencePct: presencePctOf('offer', row.price) }));
+  const offers = offerAges.map((row, i) => {
+    const aged = row.ageMins >= realMin;
+    const markers = [];
+    if (row.presencePct >= ceilingPct) markers.push(P.marker('CEILING', { n: row.presencePct }));
+    if (i === 0 && !aged) {
+      const agedAbove = offerAges.find((o, j) => j > 0 && o.ageMins >= realMin && o.price > row.price);
+      if (agedAbove) markers.push(P.marker('UNDERCUT', { n: agedAbove.price }));
+    }
+    if (isRound(row.price)) markers.push(P.marker('SHELF'));
+    return { price: row.price, qty: row.qty, ageMins: row.ageMins, aged, presencePct: row.presencePct, markers };
+  });
+
+  return { symbol: sym, capturedAt: new Date(latest.at).toISOString(), captures: totalCaps, bids, offers };
+}
+

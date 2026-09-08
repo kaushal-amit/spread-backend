@@ -1,5 +1,15 @@
 'use strict';
+const log = require('./lib/log');
 require('dotenv').config();
+
+/*
+ * Step 2 · the production check runs FIRST — before the pool is created,
+ * before a migration is attempted. It used to run after migrate() and ping(),
+ * so a production box with a bad DATABASE_URL died with a connection error and
+ * the missing token was never mentioned. Exit 1 with the reason, nothing else.
+ */
+if (!require('./api/auth').assertProductionConfig()) process.exit(1);
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -7,15 +17,10 @@ const { Server } = require('socket.io');
 const { pool, ping } = require('./db');
 const { migrate } = require('./db/migrate');
 const daily = require('./jobs/daily');
-const screening = require('./services/screening');
-const live = require('./services/live');
-const depth = require('./services/depth');
-const alerts = require('./services/alerts');
-const claude = require('./services/ai/claude');
-const registry = require('./services/ai/registry');
-const { BUDGET, ALERT } = require('./config/spread.config');
+const { toResponse } = require('./api/errors');
+
 const { registerHandlers, startTicker, startWakeupScanner, startAlertScanner,
-  startRowPoller } = require('./socket');
+  startRowPoller, startHaltScanner } = require('./socket');
 
 const PORT = Number(process.env.PORT || 4000);
 const app = express();
@@ -23,8 +28,15 @@ app.use(express.json());
 
 // The Vite dev server runs on :3000 and the API on :4000. In production the
 // SPA is served from the same origin and this is a no-op.
+const CORS_ORIGIN = process.env.CORS_ORIGIN || null;
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  // Only the configured origin is reflected. With none configured, no CORS
+  // header at all: a browser on another origin gets nothing, and same-origin
+  // (the Vite proxy, a reverse proxy) needs none.
+  if (CORS_ORIGIN && CORS_ORIGIN !== '*') {
+    res.header('Access-Control-Allow-Origin', CORS_ORIGIN);
+    res.header('Vary', 'Origin');
+  }
   // Authorization must pass, or a token can never reach the API.
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Spread-Token');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
@@ -56,40 +68,45 @@ app.use('/api', require('./api/routes').build());
 app.use('/api/review', require('./api/review').build());
 app.use('/api', require('./api/sizing').build());
 
-// Diagnostics — the checks that were needed and did not exist.
-app.get('/api/diag/alarms', async (_req, res) => {
-  const { rows } = await pool.query(
-    `SELECT * FROM spread.data_alarm WHERE resolved_at IS NULL
-      ORDER BY raised_at DESC LIMIT 100;`);
-  res.json(rows);
-});
+// Diagnostics — the checks that were needed and did not exist (api/diag.js).
+app.use('/api/diag', require('./api/diag').build());
 
-app.get('/api/diag/coverage', async (req, res) => {
-  const day = req.query.date || daily.kuwaitDay();
-  const { rows } = await pool.query(
-    'SELECT * FROM spread.market_day WHERE trading_day = $1;', [day]);
-  res.json(rows[0] || { note: 'no market_day row — the job has not run for this date' });
+// The last line of defence for a handler that is not wrapped: a typed
+// response instead of Express's HTML 500 page, and the process stays up.
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  const { status, body } = toResponse(err);
+  if (status >= 500) log.error('[api] unhandled:', err.message);
+  res.status(status).json(body);
 });
+app.use('/api', (_req, res) => res.status(404).json({ error: 'no such endpoint', code: 'NOT_FOUND' }));
 
-app.get('/api/diag/depth/:symbol', async (req, res) => {
-  res.json(await depth.validate(req.params.symbol, req.query.date || daily.kuwaitDay()));
+/*
+ * A rejection that escapes every handler above is logged and survived. It is
+ * NOT swallowed silently — the message names it — but a trading terminal that
+ * exits on a bad query string is worse than one that logs and carries on.
+ */
+process.on('unhandledRejection', (e) => {
+  log.error('[process] unhandled rejection:', e && e.stack ? e.stack : e);
 });
-
-app.get('/api/diag/tools', (_req, res) => res.json({
-  tools: registry.assertReady(), recent: registry.recentCalls(20),
-}));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: process.env.CORS_ORIGIN || '*' } });
+const io = new Server(server, {
+  cors: CORS_ORIGIN && CORS_ORIGIN !== '*' ? { origin: CORS_ORIGIN } : {},
+});
+// Phase 3 · the socket carries the same secret as the API.
+io.use(require('./api/auth').socketMiddleware);
 registerHandlers(io);
+
+const timers = []; // interval handles, cleared on shutdown
 
 (async () => {
   try {
     const m = await migrate();
-    console.log(`[boot] migrations: ${m.applied.length} applied, ${m.skipped.length} skipped` +
+    log.info(`[boot] migrations: ${m.applied.length} applied, ${m.skipped.length} skipped` +
                 (m.drift.length ? `, DRIFT ${m.drift.join(', ')}` : ''));
     if (m.drift.length) {
-      console.warn('[boot] the database does not match the repository. Add a new migration ' +
+      log.warn('[boot] the database does not match the repository. Add a new migration ' +
                    'rather than editing an applied one.');
     }
     await ping();
@@ -100,23 +117,69 @@ registerHandlers(io);
      * outcome, because the operator then trusts a board that does not reflect
      * the setting.
      */
+    /*
+     * R-36 · the ONE threshold store. Loaded once, here, into a frozen object;
+     * a missing key aborts boot NAMING it rather than defaulting silently at
+     * request time (BACKEND_spec §1.1). gateStore.effective() reads this object.
+     */
+    const th = await require('./config/thresholds').load();
+    log.info(`[boot] kb_threshold: ${Object.keys(th).length} numbers loaded`);
+
     const g = await require('./services/gateStore').load();
-    console.log(`[boot] gate config version ${g.version}` +
+    log.info(`[boot] gate config version ${g.version}` +
                 (Object.keys(g.overrides).length ? ` (${Object.keys(g.overrides).length} overrides)` : ' (defaults)'));
 
-    require('./api/auth').warnIfOpen();
+    // R-24 · the ladder's short labels, editable in spread.kb_phrase without a
+    // deploy. Cached at boot; render() falls back to the spec defaults if a row
+    // is absent, so a marker is never blank.
+    const ph = await require('./services/phrases').load();
+    log.info(`[boot] ladder phrases: ${Object.keys(ph).length} loaded`);
 
-    server.listen(PORT, () => console.log(`[boot] SPREAD listening on ${PORT}`));
-    startTicker(io);
-    startWakeupScanner(io);
+    server.listen(PORT, () => log.info(`[boot] SPREAD listening on ${PORT}`, { port: PORT }));
+    timers.push(startTicker(io));
+    timers.push(startWakeupScanner(io));
     // Pushes the ROW, every two seconds. The scraper writes symbol_minute,
     // signal_log, position and market_day in another process, and this backend
     // has no trigger on them — LISTEN/NOTIFY would need one in public.*, which
     // is a write to the scraper's schema and lint-forbidden.
-    startRowPoller(io);
-    startAlertScanner(io);
+    timers.push(startRowPoller(io));
+    timers.push(startAlertScanner(io));
+    // FLOW 6.7 · the halt-resume detector: every 20s, session transitions across
+    // all symbols; a down-halt resume is pushed as spread:halt with the verdict
+    // already computed (the window is ~2 minutes).
+    timers.push(startHaltScanner(io));
   } catch (e) {
-    console.error('[boot] failed:', e.message);
+    log.error('[boot] failed:', e.message);
     process.exit(1);
   }
 })();
+
+/*
+ * 3.7 · graceful shutdown. SIGTERM is what systemd, Docker and a deploy send;
+ * it used to be the default handler — the process died mid-query with the
+ * pool open and a socket half-written. Now: stop the timers so nothing new
+ * starts, close the socket server and the HTTP listener, drain the pool,
+ * exit 0. A hard deadline of 5 s, then exit 1 — a shutdown that hangs is
+ * worse than one that is abrupt, because the supervisor waits on it.
+ */
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.info('[shutdown] signal received', { signal });
+  const deadline = setTimeout(() => { log.error('[shutdown] deadline passed, exiting 1'); process.exit(1); }, 5000);
+  deadline.unref();
+  try {
+    for (const t of timers) if (t) clearInterval(t);
+    await new Promise((r) => io.close(() => r()));
+    await new Promise((r) => server.close(() => r()));
+    await pool.end();
+    log.info('[shutdown] clean');
+    process.exit(0);
+  } catch (e) {
+    log.error('[shutdown] failed', e);
+    process.exit(1);
+  }
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

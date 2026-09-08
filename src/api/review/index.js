@@ -49,6 +49,47 @@ function day(raw) {
   return raw;
 }
 
+/**
+ * The dates that may be selected (R-18). From market_day WHERE total_volume > 0,
+ * so a day with symbol_day rows but no session (30 July) is not offered.
+ * Exported so both /api/review/sessions and the /api/sessions alias share it.
+ */
+async function sessionsList(db = pool) {
+  const { rows } = await db.query(`
+    WITH ends AS (
+      SELECT trading_date,
+             max(extract(hour FROM (created_at AT TIME ZONE 'Asia/Kuwait')) * 100
+               + extract(minute FROM (created_at AT TIME ZONE 'Asia/Kuwait')))::int AS last_hhmm
+        FROM public.awsat_market_quotes GROUP BY trading_date
+    ),
+    quality AS (
+      SELECT trading_date,
+             count(*) FILTER (WHERE data_quality = 'THIN')::int AS thin_symbols,
+             count(*)::int AS symbols
+        FROM public.symbol_day GROUP BY trading_date
+    )
+    SELECT m.trading_date::text            AS date,
+           m.symbols_traded,
+           m.advancing, m.declining, m.unchanged,
+           m.pct_advancing, m.regime,
+           m.total_volume, m.total_trades,
+           m.broker_seen_at IS NOT NULL    AS broker_confirmed,
+           e.last_hhmm                     AS capture_ends_hhmm,
+           (e.last_hhmm < $1)              AS truncated,
+           q.thin_symbols,
+           q.symbols,
+           CASE WHEN q.symbols > 0 AND q.thin_symbols = q.symbols THEN 'THIN'
+                WHEN q.thin_symbols > 0 THEN 'PARTIAL'
+                ELSE 'FULL' END            AS data_quality
+      FROM public.market_day m
+      LEFT JOIN ends e    ON e.trading_date = m.trading_date
+      LEFT JOIN quality q ON q.trading_date = m.trading_date
+     WHERE COALESCE(m.total_volume, 0) > 0
+     ORDER BY m.trading_date DESC`, [CLOSE_CAPTURE_MIN_HHMM]);
+  return { sessions: rows, truncated_before_hhmm: CLOSE_CAPTURE_MIN_HHMM,
+    note: 'A date absent from this list has no data — it is not a holiday list.' };
+}
+
 function build() {
   const r = express.Router();
 
@@ -65,44 +106,7 @@ function build() {
    * warn on the other.
    */
   r.get('/sessions', wrap(async (_req, res) => {
-    const { rows } = await pool.query(`
-      WITH ends AS (
-        SELECT trading_date,
-               max(extract(hour FROM (created_at AT TIME ZONE 'Asia/Kuwait')) * 100
-                 + extract(minute FROM (created_at AT TIME ZONE 'Asia/Kuwait')))::int AS last_hhmm
-          FROM public.awsat_market_quotes GROUP BY trading_date
-      ),
-      quality AS (
-        SELECT trading_date,
-               count(*) FILTER (WHERE data_quality = 'THIN')::int AS thin_symbols,
-               count(*)::int AS symbols
-          FROM public.symbol_day GROUP BY trading_date
-      )
-      SELECT m.trading_date::text            AS date,
-             m.symbols_traded,
-             m.advancing, m.declining, m.unchanged,
-             m.pct_advancing, m.regime,
-             m.total_volume, m.total_trades,
-             m.broker_seen_at IS NOT NULL    AS broker_confirmed,
-             e.last_hhmm                     AS capture_ends_hhmm,
-             (e.last_hhmm < $1)              AS truncated,
-             q.thin_symbols,
-             q.symbols,
-             CASE WHEN q.symbols > 0 AND q.thin_symbols = q.symbols THEN 'THIN'
-                  WHEN q.thin_symbols > 0 THEN 'PARTIAL'
-                  ELSE 'FULL' END            AS data_quality
-        FROM public.market_day m
-        LEFT JOIN ends e    ON e.trading_date = m.trading_date
-        LEFT JOIN quality q ON q.trading_date = m.trading_date
-       WHERE COALESCE(m.total_volume, 0) > 0
-       ORDER BY m.trading_date DESC`, [CLOSE_CAPTURE_MIN_HHMM]);
-
-    res.json({
-      sessions: rows,
-      // Stated so the front end does not invent its own cut.
-      truncated_before_hhmm: CLOSE_CAPTURE_MIN_HHMM,
-      note: 'A date absent from this list has no data — it is not a holiday list.',
-    });
+    res.json(await sessionsList(pool));
   }));
 
   /** GET /review/session/:date — the market_day row for one session. */
@@ -196,4 +200,4 @@ function build() {
   return r;
 }
 
-module.exports = { build };
+module.exports = { build, sessionsList };

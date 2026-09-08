@@ -96,4 +96,16 @@ function expectedExecutions(shares, avgTradeShares, { insideGap = false } = {}) 
   return Number((insideGap ? base * 1.05 : base).toFixed(2));
 }
 
-module.exports = { executionFeeKd, sideFeeKd, roundTripKd, expectedExecutions };
+/**
+ * The round-trip commission RATE as a fraction of notional — buy rate + sell
+ * rate, the marginal cost of the trip (the fixed per-execution settlement and
+ * the per-side minimum are size effects, not a per-price rate). Used by the m45
+ * ranking column (A5), so the ratio moves when the schedule changes on 1 October
+ * rather than resting on a typed 0.003.
+ */
+function roundTripRate({ premier = false, cfg = COMMISSION } = {}) {
+  const rate = premier ? cfg.ratePremier : cfg.rateMain;
+  return round3(2 * rate);
+}
+
+module.exports = { executionFeeKd, sideFeeKd, roundTripKd, roundTripRate, expectedExecutions };

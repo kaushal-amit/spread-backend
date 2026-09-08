@@ -20,7 +20,7 @@
  */
 
 const COMMISSION = require('./commission');
-const { GATES, BUDGET, DIRECTION } = require('../config/spread.config');
+const { GATES, BUDGET, DIRECTION, QUALITY } = require('../config/spread.config');
 
 const MAX_TICKS = 3;
 const round = (v, d) => (Number.isFinite(v) ? Number(v.toFixed(d)) : null);
@@ -167,6 +167,16 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
   const orderPriceFils = num(row.orderPriceFils ?? priceFils);
 
   const targets = opts.targets ?? null;
+  /*
+   * B-02 · Gate 10 and the capture thresholds come from the EFFECTIVE config.
+   *
+   * This read the module-level DIRECTION and hardcoded 90/70, so the
+   * `g10-direction` and `quality-capture` bindings in gateStore saved and
+   * changed nothing — the exact failure the store's header says it fixed,
+   * relocated one layer deeper. The file constants remain the default.
+   */
+  const direction = opts.direction ?? DIRECTION;
+  const quality = opts.quality ?? QUALITY;
   const targetTicks = row.targetTicks ?? bandFor(priceFils, budgetKd, cfg, targets);
   const econ = netAtTicks(budgetKd, orderPriceFils, targetTicks || 1, opts);
   const byTicks = netByTicks(budgetKd, orderPriceFils, opts);
@@ -181,6 +191,9 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
   const moves      = num(row.price_moves);
   const moves2     = num(row.price_moves_2plus);
   const tinyPct    = num(row.pct_moves_sub100);
+  // The scraper's up-only figure. NOT the gate's input (018) — shown beside it
+  // because a stock where up-only is double the blended is being walked up.
+  const tinyUpPct  = num(row.pct_moves_sub100_up);
   const postable   = num(row.pct_session_postable_800);
   const exitRatio  = num(row.pct_session_exitable_ratio);
   const exitSize   = num(row.pct_session_exitable_size_800);
@@ -243,7 +256,11 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
       known(tinyPct) ? `${Math.round(tinyPct)}%` : '—',
       known(tinyPct)
         ? `${Math.round(tinyPct)}% of price moves came from trades of 100 shares or fewer — painted tape`
-        : 'tape quality not computed'),
+        : 'tape quality not computed',
+      { sub: known(tinyUpPct) ? `up-only ${Math.round(tinyUpPct)}%` : null,
+        tinyUpPct,
+        // up-only at twice the blended: the up-moves are the small prints.
+        walkedUp: known(tinyPct) && known(tinyUpPct) && tinyPct > 0 && tinyUpPct >= 2 * tinyPct && tinyUpPct >= 30 }),
 
     pass(6, 'Postable',
       known(postable) && postable >= cfg.minPctPostable,
@@ -311,9 +328,9 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
   const change1d = num(row.change_1d_fils);
   const change5d = num(row.change_5d_fils);
   const directionWarn =
-    (known(change5d) && change5d < DIRECTION.warnChange5dFils) ||
-    (known(change1d) && change1d < DIRECTION.warnChange1dFils);
-  const directionBlocks = DIRECTION.mode === 'block' && directionWarn;
+    (known(change5d) && change5d < direction.warnChange5dFils) ||
+    (known(change1d) && change1d < direction.warnChange1dFils);
+  const directionBlocks = direction.mode === 'block' && directionWarn;
 
   gates.push(pass(10, 'Direction',
     !directionBlocks,
@@ -322,7 +339,7 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
     { warn: directionWarn && !directionBlocks,
       change1dFils: change1d, change5dFils: change5d,
       sub: '1d / 5d',
-      mode: DIRECTION.mode }));
+      mode: direction.mode }));
 
   /*
    * CAPTURE QUALITY. Gates 6 and 7 are percentages OF THE SESSION, and a
@@ -330,8 +347,8 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
    * number is not wrong — it is NOT COMPARABLE, which is worse, because it
    * sorts beside a full-session symbol as though it meant the same thing.
    */
-  const partial = known(capturePct) && capturePct < 90;
-  const tooThin = known(capturePct) && capturePct < 70;
+  const partial = known(capturePct) && capturePct < quality.minCapturePct;
+  const tooThin = known(capturePct) && capturePct < quality.refuseBelowPct;
   if (partial) {
     for (const g of gates) {
       if (g.id !== 6 && g.id !== 7) continue;
@@ -347,7 +364,17 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
     }
   }
 
+  /*
+   * C-01 · a gate that failed because the STATISTIC IS MISSING is a different
+   * failure from a gate that failed because the stock is bad, and the board
+   * has to say which. Every one of these read null for weeks and the result
+   * was indistinguishable from a quiet market.
+   */
+  for (const g of gates) {
+    g.notComputed = !g.ok && /not computed|not available/.test(g.why || '');
+  }
   const failed = gates.filter((g) => !g.ok);
+  const notComputed = failed.filter((g) => g.notComputed).map((g) => g.label.toLowerCase());
   const rising = known(num(row.close_fils)) && known(num(row.prev_close_fils))
     ? Number(row.close_fils) > Number(row.prev_close_fils) : null;
 
@@ -363,6 +390,10 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
     reasons: failed.map((g) => g.why),
     // Arithmetic, not judgement. An override button here only ever loses money.
     structural: failed.some((g) => g.structural),
+    // Which gates failed for want of a number, not for want of a stock.
+    notComputed,
+    // SCRAPER | BACKEND_BRIDGE | null — where the queue statistics came from.
+    gateStatsSource: row.gate_stats_source ?? null,
     overridable: !failed.some((g) => g.structural),
     netAtTarget: econ,
     netByTicks: byTicks,

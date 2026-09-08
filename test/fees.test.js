@@ -5,7 +5,10 @@
  * charged 2.285; the formula, assuming one execution, expects 1.680. Wrong by
  * 0.605 KD and ALWAYS in the same direction — every split fill under-reports.
  */
+const { requireTestDb } = require('./dbguard');
+requireTestDb('fees');
 const { pool } = require('../src/db');
+const fx = require('./fixtures').bind(pool);
 const { reconcile } = require('../src/jobs/reconcile-fees');
 const COMMISSION = require('../src/lib/commission');
 let p = 0, n = 0;
@@ -20,11 +23,9 @@ const DAY = '2026-08-24';
    * first version had it backwards.
    */
   const clean = async () => {
-    await pool.query(
-      `DELETE FROM spread.cash_movement WHERE order_leg_id IN
-         (SELECT id FROM spread.order_leg WHERE symbol LIKE 'FEE%')`);
-    await pool.query("DELETE FROM spread.order_leg WHERE symbol LIKE 'FEE%'");
-    await pool.query("DELETE FROM public.awsat_order_list WHERE symbol LIKE 'FEE%'");
+    await fx.clearLegs('FEE');
+    await fx.clearBrokerOrders('FEE');
+    for (const sym of ['FEESPLIT', 'FEEDUP', 'FEENONE', 'FEEEXEC', 'FEEJOB']) await fx.instrument(sym);
   };
   try {
     await clean();
@@ -44,11 +45,8 @@ const DAY = '2026-08-24';
       `INSERT INTO spread.order_leg (trading_day, symbol, contract_seq, side, status,
          price_fils, shares, filled_shares, commission_kd, executions, posted_at)
        VALUES ($1,'FEESPLIT',1,'SELL','FILLED',128,6100,6100,$2,1,now())`, [DAY, one.kd]);
-    await pool.query(
-      `INSERT INTO public.awsat_order_list (order_id, symbol, side, order_status, price,
-         quantity, filled_quantity, order_value, net_value, executions_observed,
-         trading_date, ingest_source, created_at)
-       VALUES ('BRK-1','FEESPLIT','SELL','Filled',128,6100,6100,780.8,778.515,2,$1,'awsat_client',now())`, [DAY]);
+    await fx.brokerOrder({ orderId: 'BRK-1', symbol: 'FEESPLIT', side: 'SELL', price: 128,
+      quantity: 6100, orderValue: 780.8, netValue: 778.515, executions: 2, day: DAY });
 
     const dry = await reconcile(DAY);
     chk('a dry run changes nothing', dry.broker === 1, dry);
@@ -86,12 +84,8 @@ const DAY = '2026-08-24';
          price_fils, shares, filled_shares, commission_kd, posted_at)
        VALUES ($1,'FEEDUP',1,'BUY','FILLED',200,1000,1000,0.5,now())`, [DAY]);
     for (const id of ['DUP-1', 'DUP-2']) {
-      await pool.query(
-        `INSERT INTO public.awsat_order_list (order_id, symbol, side, order_status, price,
-           quantity, filled_quantity, order_value, net_value, executions_observed,
-           trading_date, ingest_source, created_at)
-         VALUES ($2,'FEEDUP','BUY','Filled',200,1000,1000,200,200.3,1,$1,'awsat_client',now())`,
-        [DAY, id]);
+      await fx.brokerOrder({ orderId: id, symbol: 'FEEDUP', side: 'BUY', price: 200,
+        quantity: 1000, orderValue: 200, netValue: 200.3, executions: 1, day: DAY });
     }
     const amb = await reconcile(DAY, { apply: true });
     const { rows: d } = await pool.query(
@@ -117,11 +111,8 @@ const DAY = '2026-08-24';
       `INSERT INTO spread.order_leg (trading_day, symbol, contract_seq, side, status,
          price_fils, shares, filled_shares, commission_kd, executions, posted_at)
        VALUES ($1,'FEEEXEC',1,'SELL','FILLED',190,4000,4000,$2,1,now())`, [DAY, cheap.kd]);
-    await pool.query(
-      `INSERT INTO public.awsat_order_list (order_id, symbol, side, order_status, price,
-         quantity, filled_quantity, order_value, net_value, executions_observed,
-         trading_date, ingest_source, created_at)
-       VALUES ('EXEC-1','FEEEXEC','SELL','Filled',190,4000,4000,NULL,NULL,3,$1,'awsat_client',now())`, [DAY]);
+    await fx.brokerOrder({ orderId: 'EXEC-1', symbol: 'FEEEXEC', side: 'SELL', price: 190,
+      quantity: 4000, orderValue: null, netValue: null, executions: 3, day: DAY });
     await reconcile(DAY, { apply: true });
     const { rows: ex } = await pool.query(
       "SELECT commission_kd, executions, fee_source FROM spread.order_leg WHERE symbol='FEEEXEC'");
@@ -137,6 +128,19 @@ const DAY = '2026-08-24';
     chk('every source is represented', q.length >= 3, q.map((x) => x.fee_source));
     chk('and the delta survives the broker row being pruned',
         q.some((x) => Number(x.delta) !== 0), q);
+
+    console.log('\n=== R-31 · the 13:45 job (stats:daily) reconciles fees after the stats ===');
+    const jobFee = COMMISSION.sideFeeKd((205 * 1000) / 1000, { day: DAY, executions: null });
+    await pool.query(
+      `INSERT INTO spread.order_leg (trading_day, symbol, contract_seq, side, status,
+         price_fils, shares, filled_shares, commission_kd, executions, posted_at)
+       VALUES ($1,'FEEJOB',1,'SELL','FILLED',205,1000,1000,$2,1,now())`, [DAY, jobFee.kd]);
+    await fx.brokerOrder({ orderId: 'JOB-1', symbol: 'FEEJOB', side: 'SELL', price: 205,
+      quantity: 1000, orderValue: 205, netValue: 204.4, executions: 1, day: DAY });
+    const jobOut = await require('../src/jobs/stats').runDaily(DAY, { apply: true });
+    const { rows: fj } = await pool.query("SELECT fee_source FROM spread.order_leg WHERE symbol = 'FEEJOB'");
+    chk('a filled leg gets fee_source = BROKER after the job', fj[0] && fj[0].fee_source === 'BROKER', fj[0]);
+    chk('  and the job reports the reconciliation ran', jobOut.reconcileFees && !jobOut.reconcileFees.error && jobOut.reconcileFees.broker >= 1, jobOut.reconcileFees);
   } catch (e) {
     chk('the suite ran without throwing', false, e.message);
   }

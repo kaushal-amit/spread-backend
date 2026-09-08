@@ -1,3 +1,9 @@
+> **HISTORICAL — do not follow.** This run-book drove `npm run job:daily`, which
+> wrote `spread.symbol_day`, `spread.job_run` and `spread.symbol`. 011 made
+> `symbol_day` a view over the scraper's table and 015 dropped the other two, so
+> every command below fails on the first statement. The scripts are removed.
+> What replaced them: `npm run stats:daily` (README, "Who computes what").
+
 # Backfill 9–13 August
 
 **Run these in order.** The sequence guard enforces it, but the order below is

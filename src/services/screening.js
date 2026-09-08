@@ -30,32 +30,92 @@ const { GATES, BUDGET } = require('../config/spread.config');
  *   feasibility thresholds. R-01: this was never passed, so the config page's
  *   target checkboxes saved and changed nothing.
  */
+/**
+ * R-25 · FLOW step 4 checks 1-2, the LIVE direction gate. From today's capture:
+ *   check 1  current > open   (the stock is up on the session)
+ *   check 2  high > open      (it has traded above the open at some point)
+ * Runs at/after 09:20 — before that the open is not yet meaningful and the cells
+ * read "not yet" (notComputed). This is DISTINCT from the yesterday-based
+ * DIRECTION warn-gate (chg_5d / chg_1d); both are shown, named apart on the card.
+ */
+function liveDirection({ openFils, lastFils, highFils }, now = new Date(), openHhmm = 920) {
+  const kMins = (() => { const k = new Date(new Date(now).getTime() + 3 * 3600000); return k.getUTCHours() * 60 + k.getUTCMinutes(); })();
+  const gateMins = Math.floor(openHhmm / 100) * 60 + (openHhmm % 100);
+  const ready = kMins >= gateMins;
+  const have = openFils != null && lastFils != null && highFils != null;
+  if (!ready || !have) {
+    return { computed: false, currentAboveOpen: null, highAboveOpen: null,
+      note: !ready ? 'not yet — the direction gate reads from 09:20' : 'no open captured yet' };
+  }
+  const currentAboveOpen = Number(lastFils) > Number(openFils);
+  const highAboveOpen = Number(highFils) > Number(openFils);
+  return { computed: true, currentAboveOpen, highAboveOpen,
+    openFils: Number(openFils), lastFils: Number(lastFils), highFils: Number(highFils),
+    note: currentAboveOpen && highAboveOpen ? 'up on the session, and has traded above the open'
+      : highAboveOpen ? 'traded above the open but back at/under it now'
+        : 'has not traded above the open — no upward direction' };
+}
+
 async function screen(tradingDay, budgetKd = BUDGET.slotKd,
-                      { db = pool, cfg = GATES, targets = null } = {}) {
+                      { db = pool, cfg = GATES, targets = null,
+                        direction = null, quality = null, now = new Date() } = {}) {
   const { rows } = await db.query(
     `SELECT d.*,
-            -- The 2-fil gap frequency. A 2-tick target needs a queue-zero
-            -- entry, and one stock had the widest range on the board while its
-            -- gap was present only 22% of the session.
-            NULL::numeric AS gap_pct,
+            -- gap_pct, pct_session_postable_800 and the rest of the funnel's
+            -- columns come from the VIEW (016): the scraper's value first,
+            -- the backend bridge second. C-02: this line was NULL::numeric AS
+            -- gap_pct, which failed Gate 2 STRUCTURALLY for every 2-tick stock.
             p.min_budget_kd, p.max_budget_kd, p.median_price_move_count,
             p.median_daily_trade_count, p.peak_hour AS profile_peak_hour,
             p.sessions_in_window,
-            s.market, s.market_verified, s.name_ar,
+            -- public.instruments is the canonical symbol list: 142 rows with
+            -- is_primary and is_tradeable. It has no name_ar or
+            -- market_verified, so those are NULL rather than invented.
+            s.market, NULL::boolean AS market_verified, NULL::text AS name_ar,
+            s.is_tradeable, s.broker_status,
             q.bid AS live_bid, q.bid_qty AS live_bid_shares,
             q.offer AS live_offer, q.offer_qty AS live_offer_shares,
             q.created_at AS quote_at
        FROM spread.symbol_day d
-       JOIN spread.symbol s USING (symbol)
+       /**
+        * ─── public.instruments, NOT spread.symbol ─────────────────────────
+        *
+        * spread.symbol had ZERO ROWS for its whole life, and this is an INNER
+        * join — so this query returned an empty board on every session, with
+        * no error, for months. Dropping the table as an unused duplicate is
+        * what finally made it fail loudly.
+        *
+        * The canonical list is public.instruments: 142 rows, is_primary,
+        * is_tradeable, broker_status. Reading public.* is allowed; the lint
+        * rule forbids WRITING to it.
+        */
+       JOIN public.instruments s USING (symbol)
        LEFT JOIN spread.symbol_profile p USING (symbol)
        LEFT JOIN LATERAL (
-         SELECT bid::numeric, bid_qty::bigint, offer::numeric, offer_qty::bigint, created_at
+         SELECT bid::numeric, bid_qty::bigint, offer::numeric, offer_qty::bigint, created_at,
+                -- R-25 · today's open / last / high from the latest capture, for the
+                -- LIVE direction gate (FLOW step 4 checks 1-2), distinct from the
+                -- yesterday-based DIRECTION warn-gate.
+                open_price::numeric AS today_open, last_price::numeric AS today_last, high_price::numeric AS today_high
            FROM spread.v_quote_screening v
           WHERE v.symbol = d.symbol
           ORDER BY created_at DESC LIMIT 1) q ON true
       -- PARTIAL rows are INCLUDED and marked. Excluding them silently is how a
       -- stock disappears for a scraper reason rather than a trading one.
-      WHERE d.trading_day = $1 AND d.capture_quality IN ('OK','PARTIAL');`,
+      /**
+       * ─── FULL, PARTIAL, THIN — the values the column actually holds ──────
+       *
+       * This read IN ('OK','PARTIAL'). symbol_day stores FULL and THIN; 'OK'
+       * is not a value this system produces, so the filter matched nothing —
+       * a second, independent reason the board never returned a row.
+       *
+       * THIN is INCLUDED and marked. Excluding it silently is how a stock
+       * disappears for a scraper reason rather than a trading one, and 14 of
+       * 29 captured days are THIN.
+       */
+      WHERE d.trading_day = $1
+        AND (d.capture_quality IS NULL
+             OR d.capture_quality IN ('FULL','PARTIAL','THIN'));`,
     [tradingDay]);
 
   const results = rows.map((r) => {
@@ -69,7 +129,7 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
       priceFils: closeFils ?? bidFils,
       // Gate 2 prices the ORDER.
       orderPriceFils: bidFils ?? closeFils,
-    }, budgetKd, cfg, { targets });
+    }, budgetKd, cfg, { targets, direction, quality });
 
     const entry = bidFils == null ? null : pricing.suggestEntry(
       { bidFils, bidShares: Number(r.live_bid_shares),
@@ -88,6 +148,8 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
       entry,
       entryPlacement: entry?.placement ?? null,
       quoteAt: r.quote_at,
+      // R-25 · the live direction gate (FLOW step 4 checks 1-2).
+      liveDirection: liveDirection({ openFils: r.today_open, lastFils: r.today_last, highFils: r.today_high }, now),
       minBudgetKd: minKd, maxBudgetKd: maxKd,
       // Capital determines the universe. Out of reach is NOT the stock's fault
       // and the fix is different — your capital is too small for it today.
@@ -96,9 +158,18 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
       sizedDownToShares: maxKd != null && budgetKd > maxKd && bidFils
         ? pricing.sharesFor(maxKd, bidFils) : null,
       profileSessions: r.sessions_in_window,
-      behaviour: behaviourFlags(r, evaluated),
+      behaviour: behaviourFlags(r, evaluated, cfg),
     };
   });
+
+  // A5 · the m45 ranking column, read by (symbol, day) from spread.m45 — never a
+  // join, never a gate. Absent (before the 09:45 job) → null → the board shows "—".
+  const m45 = await require('../jobs/m45').m45For(tradingDay, results.map((r) => r.symbol), db).catch(() => new Map());
+  for (const r of results) {
+    const row = m45.get(String(r.symbol).toUpperCase());
+    r.m45 = row ? row.rangeOverCost : null;
+    r.m45Reason = row ? row.reason : null;
+  }
 
   const reachable = results.filter((r) => r.reachable);
   const recommended = funnel.rank(reachable.filter((r) => r.passed));
@@ -112,6 +183,12 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
   const counts = { all: results.length, recommended: recommended.length,
     nearMiss: nearMiss.length, rejected: rejected.length };
   for (const r of results) for (const f of r.failed) counts[f] = (counts[f] || 0) + 1;
+  // R-38 · why a gate could not be computed, split so TODAY can say which fix
+  // applies. No live quote this session is a scraper/market question; a quote
+  // present with no gate-statistics source is "stats:daily has not run". The
+  // no-quote case takes precedence — it is the more fundamental absence.
+  counts.noQuotes = results.filter((r) => r.quoteAt == null).length;
+  counts.noStats = results.filter((r) => r.quoteAt != null && !r.gateStatsSource).length;
 
   return {
     tradingDay, budgetKd, recommended, nearMiss, rejected, counts,
@@ -132,27 +209,30 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
  * up and distributing shows distribution first, because that combination
  * measured −1.36 the next day.
  */
-function behaviourFlags(row, ev) {
+function behaviourFlags(row, ev, cfg = GATES) {
   const f = [];
   const n = (v) => (v == null ? null : Number(v));
+  // B-02 · the same thresholds the gates use. These were 2/1.3/50/20/15/3000
+  // literals, so an operator override moved the gate and not the flag.
+  const WALL_PCT = 50;
 
-  if (n(row.volume_ratio_5d) >= 2 && n(row.flow_ratio) >= 1.3) {
+  if (n(row.volume_ratio_5d) >= cfg.distVolumeRatio && n(row.flow_ratio) >= cfg.distFlowRatio) {
     f.push({ flag: 'DISTRIBUTING', icon: '📦', priority: 1,
       why: `volume ${n(row.volume_ratio_5d)}× baseline with outward flow ${n(row.flow_ratio)}` });
   }
-  if (n(row.pct_session_exitable_ratio) != null && n(row.pct_session_exitable_ratio) < 50) {
+  if (n(row.pct_session_exitable_ratio) != null && n(row.pct_session_exitable_ratio) < WALL_PCT) {
     f.push({ flag: 'WALL', icon: '🧱', priority: 1,
       why: `exitable on only ${Math.round(n(row.pct_session_exitable_ratio))}% of the session` });
   }
-  if (n(row.pct_moves_sub100) > 20) {
+  if (n(row.pct_moves_sub100) > cfg.maxPctMovesSub100) {
     f.push({ flag: 'PAINTED', icon: '🎨', priority: 2,
       why: `${Math.round(n(row.pct_moves_sub100))}% of moves from trades under 100 shares` });
   }
-  if (n(row.price_moves) != null && n(row.price_moves) < 15) {
+  if (n(row.price_moves) != null && n(row.price_moves) < cfg.minPriceMoves) {
     f.push({ flag: 'FROZEN', icon: '🧊', priority: 3,
       why: `${n(row.price_moves)} price moves — a round trip needs price down AND up` });
   }
-  if (n(row.days_active_5d) === 0 && n(row.avg_trade_shares) < 3000) {
+  if (n(row.days_active_5d) === 0 && n(row.avg_trade_shares) < cfg.minAvgTradeShares) {
     f.push({ flag: 'DEAD', icon: '💀', priority: 3,
       why: 'no active session in five, retail-sized prints' });
   }
@@ -166,4 +246,4 @@ function behaviourFlags(row, ev) {
   return f.sort((a, b) => a.priority - b.priority);
 }
 
-module.exports = { screen, behaviourFlags };
+module.exports = { screen, behaviourFlags, liveDirection };

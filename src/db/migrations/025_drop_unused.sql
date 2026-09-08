@@ -1,0 +1,19 @@
+-- ===========================================================================
+--  025 · drop the genuinely-unused table (6.6 / R-34)
+-- ===========================================================================
+--  The 4 September drop list, applied by the rule "drop only if grep src scripts
+--  is empty after Group 8":
+--    spread.symbol_event   — no INSERT, no read anywhere → DROPPED here.
+--  KEPT, with the reason (so this is a decision, not a silent omission):
+--    spread.kb_phrase      — now read for the ladder markers (R-24).
+--    spread.ai_memory      — used by the AI context/export work (Group 9,
+--                            R-27/R-29); dropping and recreating is churn.
+--    spread.override_log   — written by POST /stocks/:symbol/override.
+--    spread.entry_alert    — written by the entry-window scanner (alerts.fire).
+--    spread.ai_query_log   — written by claude.ask (every model tool call).
+--    spread.broker_order_snapshot — referenced by scripts/copy-quotes.sql.
+--    spread.event_log      — written by the claim lifecycle (3.8).
+--  scripts/import-depth.sql is deleted in the same change.
+--  Idempotent.
+-- ===========================================================================
+DROP TABLE IF EXISTS spread.symbol_event;

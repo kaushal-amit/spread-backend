@@ -12,6 +12,8 @@ const path = require('path');
 
 (async () => {
   let query = null;
+  // dbguard: read-only — this suite only reads information_schema, so it may
+  // look at ANY database. Everything that writes goes behind requireTestDb().
   if (process.env.DATABASE_URL) {
     try {
       const { pool } = require('../src/db');
@@ -20,7 +22,10 @@ const path = require('path');
     } catch { /* the source checks still run */ }
   }
 
-  const r = await scan({ query, entryPoints: ['src/index.js', 'src/mcp/server.js'] });
+  const r = await scan({ query, entryPoints: ['src/index.js', 'src/mcp/server.js',
+    // the npm scripts — each is a process of its own
+    'src/jobs/stats/index.js', 'src/jobs/import-fills.js', 'src/jobs/reconcile-fees.js',
+    'src/db/migrate.js', 'src/db/doctor.js', 'src/db/seed-calendar.js', 'scripts/import-kb.js'] });
   console.log(r.lines.join('\n'));
 
   // Every allowlist entry states a reason and an expiry. Missing either is

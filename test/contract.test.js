@@ -27,6 +27,11 @@ console.log('=== StockCandidate ===');
     capturePct: 100, dataQuality: 'OK', behaviour: [], structural: false,
   };
   const c = present.stockCandidate(row, 790);
+  // R-06 · walkedUp is a SERVER field, so the browser stops recomputing it.
+  const wu = present.stockCandidate({ ...row, pct_moves_sub100: 15, pct_moves_sub100_up: 32 }, 790);
+  chk('metrics.walkedUp is emitted (32 up-only vs 15 blended → true)', wu.metrics.walkedUp === true, JSON.stringify(wu.metrics.walkedUp));
+  const nwu = present.stockCandidate({ ...row, pct_moves_sub100: 18, pct_moves_sub100_up: 20 }, 790);
+  chk('  and false when up-only is not 2x blended', nwu.metrics.walkedUp === false);
 
   const required = ['symbol', 'price', 'bid', 'offer', 'spread', 'entryPlacement', 'shares',
     'notionalKd', 'roundTripKd', 'netKd', 'netPerFilKd', 'trendWarn', 'status',
@@ -103,15 +108,15 @@ console.log('\n=== TradingContract ===');
   const c = present.tradingContract({
     symbol: 'EQUIPMENT', contract_seq: 1, state: 'holding', shares: 3500,
     entry: 238, bid: 236, offer: 237, committedKd: 833, unrealisedKd: -7,
-    breakEvenFils: 239, trailArmFils: 240, trailingOfferFils: 240, peakBidFils: 239,
+    breakEvenFils: 239, targetNormalFils: 240, targetTrendingFils: 244, peakBidFils: 239,
     legs: [{ id: 1, side: 'BUY', status: 'FILLED', price_fils: 238, shares: 3500,
              commission_kd: 1.75, posted_at: new Date(), note: '' }],
   });
   chk('every required field', has(c, ['symbol', 'seq', 'state', 'shares', 'entry', 'bid',
-    'offer', 'committedKd', 'unrealisedKd', 'breakEvenPrice', 'trailArmPrice',
-    'trailingOffer', 'peakSinceFill', 'stepDownTime', 'legs']).length === 0);
-  chk('break-even and trail-arm are BOTH present and adjacent',
-      c.breakEvenPrice === 239 && c.trailArmPrice === 240,
+    'offer', 'committedKd', 'unrealisedKd', 'breakEvenPrice', 'targetNormal',
+    'targetTrending', 'peakSinceFill', 'stepDownTime', 'legs']).length === 0);
+  chk('break-even and the +2 target are BOTH present',
+      c.breakEvenPrice === 239 && c.targetNormal === 240 && c.targetTrending === 244,
       'selling at 239 nets +0.001 KD; at 240 it nets +3.501');
   chk('legs carry commission to three decimals', c.legs[0].commission_kd === 1.75);
 }

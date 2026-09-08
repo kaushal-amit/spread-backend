@@ -66,7 +66,9 @@ console.log('\n=== B-18 · writes are checked when a token is set ===');
   const call = (method, header) => {
     let out = null;
     auth.middleware(
-      { method, get: (h) => (h.toLowerCase() === 'authorization' ? header : null) },
+      // A loopback request: writes without a token are allowed ONLY from
+      // 127.0.0.1, so the stub must say where it came from.
+      { method, ip: '127.0.0.1', get: (h) => (h.toLowerCase() === 'authorization' ? header : null) },
       { status: (s) => ({ json: (b) => { out = { s, b }; } }) },
       () => { out = 'next'; },
     );

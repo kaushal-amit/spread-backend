@@ -8,7 +8,7 @@
  * twice a week before you even reach the missing days.
  *
  * Two sources, in order:
- *   1. Days that actually appear in public.stock_quotes — ground truth
+ *   1. Days that carry a trading_date in public.awsat_market_quotes — ground truth
  *   2. Sun-Thu fill-in for the rest of the range, so future days exist
  *
  * Holidays are marked by hand. A day with no quotes and no holiday name is
@@ -20,17 +20,17 @@
 const { pool } = require('../db');
 const { toDay, daysBetween, isWeekday } = require('../lib/day');
 
-/** Kuwait is UTC+3 and quotes are stored UTC. */
-const KUWAIT = "AT TIME ZONE 'UTC' + interval '3 hours'";
 
 async function seed({ from = '2026-01-01', to = null, db = pool, log = console } = {}) {
   const end = to || new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
 
   // ---- 1 · days with real quotes are sessions, whatever the calendar says --
+  // 3.9 · the scraper stamps trading_date on every quote. That is the day the
+  // session traded, no conversion needed — and it is what 019 seeds from too.
   const { rows: observed } = await db.query(
-    `SELECT DISTINCT (created_at ${KUWAIT})::date AS d
-       FROM spread.v_quote_screening
-      WHERE (created_at ${KUWAIT})::date BETWEEN $1 AND $2
+    `SELECT DISTINCT trading_date AS d
+       FROM public.awsat_market_quotes
+      WHERE trading_date BETWEEN $1 AND $2
       ORDER BY d;`, [from, end]).catch(() => ({ rows: [] }));
 
   // toDay, not toISOString. The driver returns DATE as a string and calling a
@@ -84,17 +84,19 @@ async function seed({ from = '2026-01-01', to = null, db = pool, log = console }
       `SELECT trading_day FROM spread.trading_day
         WHERE is_session AND trading_day BETWEEN $1 AND $2
           AND NOT EXISTS (
-            SELECT 1 FROM spread.v_quote_screening q
-             WHERE (q.created_at ${KUWAIT})::date = spread.trading_day.trading_day)
+            SELECT 1 FROM public.awsat_market_quotes q
+             WHERE q.trading_date = spread.trading_day.trading_day)
         ORDER BY trading_day;`, [first, last]);
 
     for (const g of gaps) {
       await db.query(
         `INSERT INTO spread.data_alarm (trading_day, table_name, alarm, detail)
-         VALUES ($1, 'stock_quotes', 'NO_ROWS',
+         VALUES ($1, 'awsat_market_quotes', 'NO_ROWS',
                  jsonb_build_object('note',
                    'weekday inside the observed range with no quotes — holiday or scraper failure, and those look identical'))
-         ON CONFLICT DO NOTHING;`, [g.trading_day]).catch(() => {});
+         ON CONFLICT (table_name, alarm, COALESCE(trading_day, '0001-01-01'::date),
+                      COALESCE(column_name, ''), COALESCE(symbol, ''))
+         WHERE resolved_at IS NULL DO NOTHING;`, [g.trading_day]);
     }
     if (gaps.length) {
       log.warn(`[calendar] ${gaps.length} session days with no quotes — raised in data_alarm`);

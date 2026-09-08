@@ -9,12 +9,12 @@
   "tables": [
     {
       "name": "spread.quote",
-      "reason": "the fallback 002 no longer takes \u2014 it now RAISEs instead. Kept so an applied migration need not be edited; a reader would recreate the second-source-of-truth the schema boundary prevents.",
+      "reason": "the fallback 002 no longer takes — it now RAISEs instead. Kept so an applied migration need not be edited; a reader would recreate the second-source-of-truth the schema boundary prevents.",
       "until": "2026-10-31"
     },
     {
       "name": "spread.depth",
-      "reason": "same as spread.quote \u2014 created by 007 unconditionally, written by nothing, read by nothing.",
+      "reason": "same as spread.quote — created by 007 unconditionally, written by nothing, read by nothing.",
       "until": "2026-10-31"
     }
   ],
@@ -30,13 +30,8 @@
       "until": "2026-12-31"
     },
     {
-      "name": "src/db/seed-symbols.js",
-      "reason": "run by hand. Same as doctor.",
-      "until": "2026-12-31"
-    },
-    {
       "name": "src/jobs/daily/index.js",
-      "reason": "INERT \u2014 it computed spread.symbol_day and spread.market_day, which are now VIEWS over public.*. Kept with a comment saying what replaced it; do not wire it back up.",
+      "reason": "INERT — it computed spread.symbol_day and spread.market_day, which are now VIEWS over public.*. Kept with a comment saying what replaced it; do not wire it back up.",
       "until": "2026-12-31"
     },
     {
@@ -53,7 +48,29 @@
   "functions": [
     {
       "name": "source",
-      "reason": "a word inside this scanner's own regex literal \u2014 /source(/ parses as a call. A JS tokeniser would fix it properly; one entry is cheaper than one.",
+      "reason": "a word inside this scanner's own regex literal — /source(/ parses as a call. A JS tokeniser would fix it properly; one entry is cheaper than one.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "take",
+      "reason": "a method on the bucket object literal in api/ratelimit.js; the scanner sees a call to a name it did not see declared as a function.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "postgres",
+      "reason": "not a call: `postgres(ql)?://` inside the read-only-role regex in mcp/server.js.",
+      "until": "2026-12-31"
+    }
+  ],
+  "reads": [
+    {
+      "name": "spread.symbol",
+      "reason": "read only by src/db/seed-symbols.js, which is superseded and documented as such — spread.symbol was dropped by 015 as an empty duplicate of public.instruments.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "spread.job_run",
+      "reason": "read only by the inert src/jobs/daily/index.js, deliberately unrepaired.",
       "until": "2026-12-31"
     }
   ]

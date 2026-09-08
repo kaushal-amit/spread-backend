@@ -56,8 +56,12 @@ for (const f of files) {
   // 015 uses FOREACH ... EXECUTE inside a DO block — dynamic SQL, which pg-mem
   // does not parse. It runs against real Postgres, twice, and is verified
   // re-runnable there.
+  // 016 and 017 read public.symbol_day / public.instruments and use
+  // NOT VALID / partial unique indexes — real Postgres only, as above.
   if (f === '010_repoint_to_kse.sql' || f === '011_symbol_day_reads_public.sql'
-      || f === '015_drop_duplicates.sql') {
+      || f === '015_drop_duplicates.sql' || f === '016_gate_stats_bridge.sql'
+      || f === '017_trading_constraints.sql' || f === '018_gate5_blended_tape.sql'
+      || f === '019_kuwait_day.sql' || f === '020_session_stops.sql' || f === '021_bid_age_stop.sql') {
     chk(f + '  skipped here — needs real Postgres and public.* tables',
        true, 'verified in views.test.js against a kse-shaped database');
     continue;
@@ -93,11 +97,13 @@ const has = (t) => {
 };
 for (const t of ['quote', 'depth', 'broker_order_snapshot',
                  'symbol', 'trading_day', 'symbol_day', 'symbol_profile', 'market_day',
-                 'symbol_event', 'order_leg', 'cash_movement', 'claim', 'override_log',
+                 'order_leg', 'cash_movement', 'claim', 'override_log',
                  'depth_signal', 'entry_alert', 'depth_watchlist', 'gate_config',
                  'event_log', 'ai_note', 'job_run', 'data_alarm']) {
   chk(`spread.${t}`, has(t));
 }
+// 6.6 / R-34 · spread.symbol_event was dropped (025) — no writer, no reader.
+chk('spread.symbol_event is dropped', !has('symbol_event'));
 
 console.log('\n=== naming rules, enforced mechanically ===');
 /*
@@ -169,8 +175,12 @@ console.log('\n=== no two migrations share a number ===');
   // 015 uses FOREACH ... EXECUTE inside a DO block — dynamic SQL, which pg-mem
   // does not parse. It runs against real Postgres, twice, and is verified
   // re-runnable there.
+  // 016 and 017 read public.symbol_day / public.instruments and use
+  // NOT VALID / partial unique indexes — real Postgres only, as above.
   if (f === '010_repoint_to_kse.sql' || f === '011_symbol_day_reads_public.sql'
-      || f === '015_drop_duplicates.sql') {
+      || f === '015_drop_duplicates.sql' || f === '016_gate_stats_bridge.sql'
+      || f === '017_trading_constraints.sql' || f === '018_gate5_blended_tape.sql'
+      || f === '019_kuwait_day.sql' || f === '020_session_stops.sql' || f === '021_bid_age_stop.sql') {
     chk(f + '  skipped here — needs real Postgres and public.* tables',
        true, 'verified in views.test.js against a kse-shaped database');
     continue;

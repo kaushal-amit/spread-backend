@@ -19,17 +19,38 @@
  * backend connects fine. A test that connects differently from the app is
  * testing a different thing.
  */
+const { requireTestDb } = require('./dbguard');
+requireTestDb('views');
 const { pool } = require('../src/db');
+const fx = require('./fixtures').bind(pool);
+
+/**
+ * A schema-only kse_test (pg_dump -s) holds no captures, so the rows the views
+ * must return are SEEDED — one print per session label, one depth level, one
+ * daily bar — and removed at the end. On a database that has data as well the
+ * assertions still hold; the seed only adds.
+ */
+const SYM = 'SZTESTVIEW', DAY = fx.TEST_DAY;
+async function seed() {
+  await fx.instrument(SYM);
+  let m = 0;
+  for (const session of ['Trading', 'CB Auction', '', 'Close Auction Acceptance']) {
+    await fx.quote(SYM, { day: DAY, at: `${DAY}T06:${String(m++).padStart(2, '0')}:00Z`, session,
+      last: 200, bid: 199, offer: 200, volume: 1000 * (m + 1), trades: m + 1 });
+  }
+  await fx.depthLevel(SYM, { level: 1, bid: 199, bidQty: 5000, offer: 200, offerQty: 4000 });
+  await fx.daily(SYM, DAY, { open: 199, high: 201, low: 198, close: 200, volume: 4000 });
+}
+async function clean() {
+  await fx.clearQuotes(SYM); await fx.clearDepth(SYM); await fx.clearDaily(SYM);
+  await fx.clearInstruments(SYM);
+}
 
 (async () => {
-  const url = process.env.DATABASE_URL;
-  if (!url) {
-    console.log('\n=== view content ===\n  SKIP  no DATABASE_URL — these need real Postgres\n');
-    return;
-  }
   let bad = 0;
   console.log('\n=== the views return rows, not just resolve ===');
   try {
+    await seed();
     for (const v of ['v_quote', 'v_quote_screening', 'v_depth', 'v_daily']) {
       const { rows } = await pool.query(`SELECT count(*)::int AS n FROM spread.${v}`);
       if (rows[0].n > 0) console.log(`  OK   spread.${v} returns ${rows[0].n} row(s)`);
@@ -68,11 +89,17 @@ const { pool } = require('../src/db');
       bad++;
       console.log(`  FAIL v_depth has ${d[0].dupes} duplicated key(s) — server and client writes double-count`);
     }
+    // The auction band is EXCLUDED from executable prints.
+    const { rows: ex } = await pool.query(
+      `SELECT count(*)::int AS n FROM spread.v_quote WHERE symbol = $1 AND session = 'Close Auction Acceptance'`, [SYM]);
+    if (ex[0].n === 0) console.log('  OK   v_quote excludes Close Auction Acceptance');
+    else { bad++; console.log('  FAIL v_quote carries the auction band'); }
   } catch (e) {
     console.log(`  FAIL could not read the views — ${e.message.slice(0, 80)}`);
     bad++;
   }
+  try { await clean(); } catch (e) { bad++; console.log(`  FAIL cleanup — ${e.message.slice(0, 80)}`); }
   try { await pool.end(); } catch {}
-  console.log(bad ? `\nFAILURES: ${bad}` : '\nALL PASS  (7 checks)');
+  console.log(bad ? `\nFAILURES: ${bad}` : '\nALL PASS  (8 checks)');
   process.exit(bad ? 1 : 0);
 })();

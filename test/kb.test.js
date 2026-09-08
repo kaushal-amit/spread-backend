@@ -1,5 +1,7 @@
 /** The KB import and the row poller. */
 const { importAll, sections, signals } = require('../scripts/import-kb');
+const { requireTestDb } = require('./dbguard');
+requireTestDb('kb');
 const { pool } = require('../src/db');
 let p = 0, n = 0;
 const chk = (t, c, x) => { n++; if (c) p++; else console.log('  FAIL', t, x === undefined ? '' : JSON.stringify(x)); };
@@ -44,6 +46,10 @@ const chk = (t, c, x) => { n++; if (c) p++; else console.log('  FAIL', t, x === 
         [byHeading.size, rows.length]);
 
     console.log('\n=== stored, and re-runnable ===');
+    // Apply FIRST. The count used to come before the write, so on a fresh
+    // kse_test the table was empty and the check failed once, then passed on
+    // every rerun — the same shape as a flaky test, but it was an ordering bug.
+    await importAll({ apply: true });
     const { rows: db1 } = await pool.query('SELECT count(*)::int c FROM spread.kb_rule');
     chk('the table holds every row', db1[0].c === rows.length, [db1[0].c, rows.length]);
     await importAll({ apply: true });

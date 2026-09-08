@@ -1,4 +1,5 @@
 'use strict';
+const log = require('../lib/log');
 /**
  * ============================================================================
  *  errors.js — typed failures, so the client can tell them apart
@@ -28,6 +29,8 @@ const notFound = (msg, detail) => new ApiError(404, 'NOT_FOUND', msg, detail);
 /** A deliberate refusal — a rule said no. NEVER retried by the client. */
 const refused = (msg, detail) => new ApiError(409, 'REFUSED', msg, detail);
 const unauthorised = (msg) => new ApiError(401, 'UNAUTHORISED', msg);
+/** The server's own data is not what the code needs — a seed or a job has not run. */
+const notReady = (msg, detail) => new ApiError(503, 'NOT_READY', msg, detail);
 
 /** Postgres codes that mean "the schema is not what the code expects". */
 const PG = {
@@ -42,15 +45,23 @@ function toResponse(err) {
   if (err instanceof ApiError) {
     return { status: err.status, body: { error: err.message, detail: err.detail, code: err.code } };
   }
+  /*
+   * S-06 · the body names the CLASS of failure; the log gets the message.
+   * A raw Postgres error carries column names, SQL fragments and sometimes
+   * parameter values, and the client's retry policy needs none of them.
+   */
   const pg = PG[err?.code];
   if (pg) {
-    return { status: 503, body: { error: pg[1], detail: err.message, code: pg[0] } };
+    return { status: 503, body: { error: pg[1], detail: `postgres ${err.code}`, code: pg[0] } };
   }
   if (err?.code === 'ENOTFOUND' || err?.code === 'ETIMEDOUT' || err?.code === 'ECONNREFUSED') {
-    return { status: 503, body: {
-      error: 'the database is not reachable', detail: err.message, code: 'DB_DOWN' } };
+    return { status: 503, body: { error: 'the database is not reachable', detail: null, code: 'DB_DOWN' } };
   }
-  return { status: 500, body: { error: err?.message || 'unexpected', code: 'INTERNAL' } };
+  // 23514 check_violation / 23503 fk_violation: the constraint name is safe and useful.
+  if (err?.code === '23514' || err?.code === '23503') {
+    return { status: 409, body: { error: 'the write violates a ledger rule', detail: err.constraint || null, code: 'REFUSED' } };
+  }
+  return { status: 500, body: { error: 'unexpected error', detail: null, code: 'INTERNAL' } };
 }
 
 /**
@@ -61,9 +72,9 @@ const wrap = (fn) => async (req, res) => {
   try { await fn(req, res); }
   catch (e) {
     const { status, body } = toResponse(e);
-    if (status >= 500) console.error(`[api] ${req.method} ${req.path}:`, e.message);
+    if (status >= 500) log.error(`[api] ${req.method} ${req.path}:`, e.message);
     res.status(status).json(body);
   }
 };
 
-module.exports = { ApiError, badRequest, notFound, refused, unauthorised, toResponse, wrap };
+module.exports = { ApiError, badRequest, notFound, refused, unauthorised, notReady, toResponse, wrap };

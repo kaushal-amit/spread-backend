@@ -62,13 +62,21 @@ const boardInflight = new Map();  // key -> Promise<value>
 let boardRuns = 0;                // the funnel-run counter the concurrency test asserts on
 const log = require('../lib/log');
 
-// SPR-01: the day the board SCREENS on.
-// spread.symbol_day is written at 13:30 after the close, so mid-session TODAY
-// has no row -- the board defaulted to kuwaitDay() and screened an empty day,
-// returning 0 symbols while the market traded. Screen the latest COMPLETED
-// session instead (its stats joined with today's live quotes via the LATERAL).
-// If the asked day has a row, use it; else the latest symbol_day on/before it;
-// else the asked day unchanged (empty then means no data, not the wrong day).
+/**
+ * SPR-01 · the day the board SCREENS on.
+ *
+ * spread.symbol_day is computed at 13:30 after the close, so during a live
+ * session TODAY has no row yet — and the board defaulted to kuwaitDay(), so it
+ * screened an empty day and returned zero symbols while 133 traded. The screen
+ * is meant to run on the latest COMPLETED session's stats joined with today's
+ * live quotes (the LATERAL already pulls the live touch), which is exactly what
+ * screening on yesterday's symbol_day row does.
+ *
+ * Rule: if the requested day has rows, use it (an explicit review date, or today
+ * after 13:30). Otherwise fall back to the latest symbol_day on or before it.
+ * A day with no data anywhere returns unchanged — an empty board then means no
+ * data, not the wrong day, and the log line says which.
+ */
 async function resolveScreenDay(day) {
   const { rows } = await pool.query(
     `SELECT (SELECT count(*) FROM spread.symbol_day WHERE trading_day = $1::date) AS asked_n,
@@ -80,18 +88,26 @@ async function resolveScreenDay(day) {
 
 async function board(day, budgetKd) {
   const cfg = gateStore.effective();
+  // SPR-01 · screen the latest COMPLETED session when the asked day has no row
+  // yet (today, mid-session). Keyed and cached on the RESOLVED day.
   const screenDay = await resolveScreenDay(day);
+  // Keyed on the gate VERSION too, so an edit takes effect on the next read
+  // rather than after the cache happens to expire.
   const key = `${screenDay}:${budgetKd}:${gateStore.meta().version}`;
   const hit = boardCache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.value;
   const flying = boardInflight.get(key);
-  if (flying) return flying;
+  if (flying) return flying; // a run is already under way for this key — share it
   const promise = (async () => {
     boardRuns += 1;
+    // R-01 · TARGETS travels with GATES. Passing only GATES meant the target
+    // capture toggles were stored, never read, and reset on reload.
     const value = await screening.screen(screenDay, budgetKd,
       { cfg: cfg.GATES, targets: cfg.TARGETS, direction: cfg.DIRECTION, quality: cfg.QUALITY });
-    log.info('[board] asked ' + day + ' -> screened ' + screenDay + ' : '
-      + (value && value.counts ? value.counts.all : 0) + ' symbols');
+    // SPR-01 · the log that tells "wrong day asked" from "every symbol failed a
+    // gate" apart: what was asked, what was screened, and how many came back.
+    log.info(`[board] asked ${day} → screened ${screenDay} · ${value?.counts?.all ?? 0} symbols `
+      + `(${value?.counts?.recommended ?? 0} rec / ${value?.counts?.nearMiss ?? 0} near / ${value?.counts?.rejected ?? 0} rej)`);
     boardCache.set(key, { at: Date.now(), value });
     return value;
   })();
@@ -837,4 +853,4 @@ function build() {
   return r;
 }
 
-module.exports = { build, board, invalidate, contracts, accountSummary, pnlSummary };
+module.exports = { build, board, invalidate, contracts, accountSummary, pnlSummary, resolveScreenDay };

@@ -47,7 +47,9 @@ const { SESSION, QUALITY } = require('../../config/spread.config');
 const steps = require('./steps');
 const { toDay } = require('../../lib/day');
 
-const K = "AT TIME ZONE 'UTC' + interval '3 hours'";
+// Kuwait WALL CLOCK, for hour-of-day only. The session DAY is never derived
+// from this: that is spread.kuwait_day() (019), which rolls at 04:00.
+const K = "AT TIME ZONE 'Asia/Kuwait'";
 
 /**
  * Which table the scrapers write to.
@@ -101,7 +103,7 @@ async function sessionGuard(day, db) {
             to_char(max(created_at ${K}), 'HH24:MI')       AS last_capture,
             max((created_at ${K})::time)                    AS last_time
        FROM ${src}
-      WHERE (created_at ${K})::date = $1;`, [day]);
+      WHERE spread.kuwait_day(created_at) = $1;`, [day]);
 
   const rowsToday = Number(r.rows_today);
   if (rowsToday === 0) {
@@ -297,6 +299,19 @@ if (require.main === module) {
    * So POSITIONAL DATES ARE THE PRIMARY FORM and flags are accepted as well.
    * One date is a single day; two are a range.
    */
+  /*
+   * D-01 · this entry point is INERT and says so.
+   *
+   * 015 dropped spread.job_run, spread.symbol and depth_watchlist; symbol_day
+   * and market_day are views. Every write below fails on the first statement.
+   * The npm script is gone; running the file directly gets this, not a stack
+   * trace. The module stays because routes.js imports kuwaitDay() from it.
+   */
+  console.error('jobs/daily is INERT. The scraper computes public.symbol_day; the backend reads it\n'
+    + 'through spread.symbol_day and adds its own gate statistics with `npm run stats:daily`\n'
+    + '(src/jobs/stats). See README "Who computes what".');
+  process.exit(2);
+  // eslint-disable-next-line no-unreachable
   const argv = process.argv.slice(2);
   const flag = (k) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : null; };
   const dates = argv.filter((a) => /^\d{4}-\d{2}-\d{2}$/.test(a));

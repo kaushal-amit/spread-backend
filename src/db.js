@@ -36,7 +36,7 @@ const pool = new Pool({
   max: Number(process.env.PG_POOL_MAX || 10),
   idleTimeoutMillis: 30000,
   // A screening query that hangs blocks the tick loop. Fail instead.
-  statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS || 20000)
+  statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS || 20000),
 });
 
 pool.on('error', (e) => console.error('[db] idle client error:', e.message));

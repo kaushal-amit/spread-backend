@@ -17,6 +17,8 @@
 const { GATES, DIRECTION, EVIDENCE, EXIT, BUDGET, QUALITY } = require('../config/spread.config');
 
 const n2 = (v) => (v == null || Number.isNaN(Number(v)) ? 0 : Number(Number(v).toFixed(2)));
+// 3.8 · nullable: a number that is not known travels as null, never as 0.
+const n2n = (v) => (v == null || Number.isNaN(Number(v)) ? null : Number(Number(v).toFixed(2)));
 const n3 = (v) => (v == null || Number.isNaN(Number(v)) ? 0 : Number(Number(v).toFixed(3)));
 
 /* The four groups the card renders, in the order the design fixed. */
@@ -198,11 +200,25 @@ function stockCandidate(r, budgetKd) {
     metrics: {
       priceFils: n2(r.priceFils),
       netKd,
+      // A5 · the 09:00–09:45 range-over-cost. A ranking column, NOT a gate: null
+      // before the 09:45 job has run (the board shows "—"); a THIN/absent window
+      // carries the reason for the tooltip. Sourced from spread.m45 by day.
+      m45: r.m45 == null ? null : n3(r.m45),
+      m45Reason: r.m45Reason ?? null,
       netPerFilKd: shares ? n3(shares / 1000) : 0,
       tradeSizeShares: n2(r.avg_trade_shares),
       movesPerDay: n2(r.price_moves),
       moves2PlusPerDay: n2(r.price_moves_2plus),
       tapeQualityPct: n2(r.pct_moves_sub100),
+      // The up-only figure beside the blended one. Divergence is information:
+      // up-only at twice blended means the up-moves are the small prints.
+      tapeQualityUpPct: r.pct_moves_sub100_up == null ? null : n2(r.pct_moves_sub100_up),
+      // R-06 · the walked-up marker, computed HERE (funnel.js gate 5), never in
+      // the browser: up-only tiny prints at >= 2x the blended figure and >= 30%.
+      walkedUp: (() => {
+        const b = r.pct_moves_sub100, u = r.pct_moves_sub100_up;
+        return b != null && u != null && Number(b) > 0 && Number(u) >= 2 * Number(b) && Number(u) >= 30;
+      })(),
       postablePct: n2(r.pct_session_postable_800),
       exitDepthPct: n2(r.pct_session_exitable_ratio),
       volSpikeRatio: n2(r.volume_ratio_5d),
@@ -216,6 +232,15 @@ function stockCandidate(r, budgetKd) {
     },
     dataQuality: r.dataQuality || 'OK',
     dataQualityPct: r.capturePct == null ? undefined : n2(r.capturePct),
+    // C-01 · a gate that failed for want of a NUMBER, named. The screen must
+    // render these differently from a stock that is bad — for weeks they were
+    // indistinguishable and the board read as a quiet market.
+    notComputed: r.notComputed || [],
+    // R-25 · the live direction gate (FLOW step 4 checks 1-2), computed here from
+    // today's open/last/high, distinct from the yesterday-based DIRECTION warn-gate.
+    liveDirection: r.liveDirection || null,
+    // SCRAPER | BACKEND_BRIDGE | null — where the queue statistics came from.
+    gateStatsSource: r.gateStatsSource ?? null,
   };
 }
 
@@ -233,6 +258,10 @@ function orderBook(row, ladder = [], prev = null) {
       changed: !before ? 'same'
         : qty < before.qty ? 'thinned' : qty > before.qty ? 'thickened' : 'same',
       prevQty: before?.qty,
+      // R-24 · ladder markers, filled by routes.orderBookFor from depth.ladder
+      // (BAIT/AGED/UNDERCUT/CEILING/SHELF/NOPROT/CATCH). Empty by default so the
+      // shape is stable when no depth history is captured.
+      markers: [],
     };
   };
 
@@ -276,6 +305,35 @@ function accountState(a, pnl = {}) {
   };
 }
 
+/** The market strip: breadth and regime from the scraper's market_day. */
+function marketDay(r) {
+  if (!r) return null;
+  return {
+    tradingDay: r.trading_day,
+    symbolsTraded: Number(r.symbols_traded || 0),
+    up: Number(r.advancing || 0), down: Number(r.declining || 0), flat: Number(r.unchanged || 0),
+    breadthPct: n2(r.pct_advancing),
+    breadth5dAvgPct: n2(r.breadth_5d_avg),
+    regime: r.regime || null,
+    // R-05 · the band the strip colours by, from the scraper's regime text —
+    // so the 35/50 thresholds live in ONE place (the stats job / the stops
+    // service), never re-derived in the browser. null when regime is absent.
+    breadthBand: (() => {
+      const g = String(r.regime || '').toUpperCase().replace(/\s+/g, '_');
+      if (/RISK_OFF|BEAR|WEAK/.test(g)) return 'risk_off';
+      if (/RISK_ON|BULL|STRONG/.test(g)) return 'risk_on';
+      if (g) return 'neutral';
+      return null;
+    })(),
+    volumeShares: Number(r.total_volume || 0),
+    trades: Number(r.total_trades || 0),
+    turnoverKd: n2(r.turnover_kd),
+    volumeVs20d: n2(r.volume_vs_20d),
+    indexYtdPct: r.index_ytd_pct == null ? null : n2(r.index_ytd_pct),
+    computedAt: r.computed_at ? new Date(r.computed_at).toISOString() : null,
+  };
+}
+
 function ledgerEntry(r) {
   return {
     id: Number(r.id),
@@ -290,24 +348,60 @@ function ledgerEntry(r) {
   };
 }
 
+/** /api/health. Pure, so the stale rule can be tested without a clock. */
+const HEALTH_STALE_AFTER_SEC = 300;
+function health({ now, latestQuoteAt, latestStatsDay, statsSource = null, session, staleSlots = null }) {
+  const nowMs = new Date(now).getTime();
+  const quoteAgeSec = latestQuoteAt ? Math.max(0, Math.round((nowMs - new Date(latestQuoteAt).getTime()) / 1000)) : null;
+  const open = !!session?.open;
+  // A4 · stale slots are REPORTED, never a 503. The 503 stays the quote-age rule
+  // (the whole feed is down); a single stale slot is a per-slot warning, not an
+  // outage. staleSlots is the count when known, null when not computed.
+  const stale = open && (quoteAgeSec == null || quoteAgeSec > HEALTH_STALE_AFTER_SEC);
+  return {
+    status: stale ? 'stale' : 'ok',
+    time: new Date(now).toISOString(),
+    quoteAgeSec,
+    staleSlots: staleSlots == null ? null : Number(staleSlots),
+    latestQuoteAt: latestQuoteAt ? new Date(latestQuoteAt).toISOString() : null,
+    latestStatsDay: latestStatsDay ? require('../lib/day').toDay(latestStatsDay) : null,
+    statsSource: statsSource ?? null,
+    session: { open, phase: session?.phase ?? null },
+    staleAfterSec: HEALTH_STALE_AFTER_SEC,
+    note: stale ? `no quote for ${quoteAgeSec == null ? 'ever' : quoteAgeSec + ' s'} while the session is open — the scraper is not writing` : null,
+  };
+}
+
 function tradingContract(c) {
   return {
     symbol: c.symbol,
     seq: Number(c.contract_seq ?? c.seq ?? 1),
     state: c.state,
     shares: Number(c.shares || 0),
-    entry: n2(c.entry),
-    bid: n2(c.bid),
-    offer: n2(c.offer),
+    entry: n2n(c.entry),
+    // null when there is no quote today (markedAt = 'entry'), never the entry
+    // price wearing the bid's name.
+    bid: n2n(c.bid),
+    offer: n2n(c.offer),
     committedKd: n2(c.committedKd),
-    unrealisedKd: n2(c.unrealisedKd),
+    unrealisedKd: n2n(c.unrealisedKd),
     // Break-even and trail-arm are adjacent on the card DELIBERATELY. On one
     // real position they were 239 and 240, and selling at 239 nets +0.001 KD.
-    breakEvenPrice: n2(c.breakEvenFils),
-    trailArmPrice: n2(c.trailArmFils),
-    trailingOffer: n2(c.trailingOfferFils),
-    peakSinceFill: n2(c.peakBidFils),
+    breakEvenPrice: n2n(c.breakEvenFils),
+    // R-41 · the exit target, +2 / +6 (FLOW step 7). The prototype trailing
+    // offer is gone.
+    targetNormal: n2n(c.targetNormalFils),
+    targetTrending: n2n(c.targetTrendingFils),
+    peakSinceFill: n2n(c.peakBidFils),
     stepDownTime: EXIT.stepDownAtClock,
+    // B-08 · shares is what is STILL HELD; boughtShares is the fill. They
+    // differ after a partial sell, and the difference used to be invisible.
+    boughtShares: Number(c.boughtShares ?? c.shares ?? 0),
+    openedOn: c.openedOn ?? null,
+    // 'quote' when marked at today's bid, 'entry' when no quote exists today
+    // (unrealised then reads 0.00 and must not be trusted), null for a claim.
+    markedAt: c.markedAt ?? null,
+    quoteAt: c.quoteAt ? new Date(c.quoteAt).toISOString() : null,
     legs: (c.legs || []).map((l) => ({
       id: Number(l.id),
       contractId: Number(c.contract_seq ?? c.seq ?? 1),
@@ -468,6 +562,8 @@ function gateConfigs(cfg = null, meta = {}) {
 }
 
 module.exports = {
+  health,
+  marketDay,
   stockCandidate, orderBook, accountState, ledgerEntry, tradingContract,
   sessionInfo, gateConfigs, gateGroups,
 };

@@ -75,6 +75,26 @@ const RUNTIME_PATH = new RegExp(
   'path\\.join\\([^)]*[\'"]([\\w.-]+\\.js)[\'"]'
   + '|new\\s+Worker\\(\\s*[\'"]([^\'"]+\\.js)[\'"]', 'g');
 
+/**
+ * Words that follow FROM or JOIN and are not tables.
+ *
+ * LATERAL and the join types are SQL. The rest are English, appearing inside a
+ * comment that sits WITHIN a query string — which the stripper cannot reach,
+ * because the query itself is the string.
+ */
+const SQL_AFTER_FROM = new Set([
+  'lateral', 'unnest', 'generate_series', 'jsonb_array_elements', 'json_array_elements',
+  'left', 'right', 'inner', 'outer', 'full', 'cross', 'natural',
+  'the', 'a', 'an', 'is', 'it', 'that', 'this', 'each', 'other', 'either', 'both',
+  'two', 'one', 'first', 'last', 'before', 'after', 'outside', 'inside',
+  'rather', 'writing', 'reading', 'days', 'here', 'there', 'which', 'what',
+  'and', 'or', 'not', 'only', 'every', 'any', 'same', 'them', 'those',
+  'ours', 'theirs', 'now', 'then', 'four', 'five', 'three', 'six', 'ten',
+  'here', 'where', 'when', 'why', 'how', 'with', 'in', 'on', 'at', 'by', 'to',
+  'its', 'their', 'his', 'her', 'our', 'your', 'my',
+  'half', 'reality', 'nothing', 'something', 'anything', 'everything',
+]);
+
 const SQL_WORDS = /^(count|sum|max|min|avg|coalesce|greatest|least|nullif|cast|round|extract|now|array_agg|string_agg|percentile_cont|to_char|date_trunc|lower|upper|length|abs|floor|ceil|regexp_replace|jsonb_build_object|row_number|rank|lag|lead|generate_series|unnest|_)$|_(count|observed|at|on|id|kd|pct|qty|fils|shares|days|hhmm)$/;
 
 const GLOBALS = new Set([
@@ -159,6 +179,19 @@ function scanFunctions(files, allow) {
   let calls = 0;
 
   for (const f of files.filter((x) => x.endsWith('.js'))) {
+    /**
+     * THE SCANNER CANNOT SCAN ITSELF.
+     *
+     * This file is full of regexes that describe JavaScript syntax — quotes,
+     * backticks, comment markers — so the stripper misreads its own source and
+     * removes three quarters of it, leaving every function looking undefined.
+     *
+     * Skipped by name and stated here rather than allowlisted ten times, one
+     * per function. A proper tokeniser would fix it; ten entries that grow
+     * every time this file gains a function would not.
+     */
+    if (f.endsWith('source-scan.js')) continue;
+
     const code = strip(fs.readFileSync(f, 'utf8'));
     const defined = new Set();
 
@@ -296,6 +329,114 @@ function scanModules(files, testFiles, allow, entryPoints) {
   return { orphans, testOnly, scanned, searched: files.length + testFiles.length };
 }
 
+// ── 5 · A TABLE THAT IS READ MUST EXIST ────────────────────────────────────
+/**
+ * ─── THE SHAPE THAT KEEPS GETTING THROUGH ─────────────────────────────────
+ *
+ * Check 2 finds tables NOBODY WRITES. It cannot see tables that something
+ * READS. And the failure that has now appeared eight times is a table with
+ * zero writers, zero rows, and a live reader:
+ *
+ *   spread.symbol        INNER JOIN in screening.js — returned an EMPTY BOARD
+ *                        on every session for months, with no error
+ *   spread.quote/depth   served empty views for months
+ *   public.position      committed_kd read it and returned 0 forever
+ *   broker_net_value_kd  read by two consumers, NULL always
+ *   observed_at          a column that does not exist, cursored on silently
+ *
+ * None errored. Every one returned something plausible.
+ *
+ * WARNS, never fails: aliases, CTEs and computed names make this noisy, and a
+ * noisy check that blocks a deploy gets switched off.
+ */
+async function scanReads(query, files, allow) {
+  const { rows } = await query(`
+    SELECT table_schema || '.' || table_name AS name FROM information_schema.tables
+     WHERE table_schema IN ('public', 'spread')
+    UNION
+    SELECT table_name FROM information_schema.tables
+     WHERE table_schema IN ('public', 'spread')`);
+  const exists = new Set(rows.map((r) => r.name.toLowerCase()));
+
+  // Every column name in the two schemas, so a wrapped line naming one is not
+  // reported as a missing table.
+  const { rows: cols } = await query(`
+    SELECT DISTINCT lower(column_name) AS c FROM information_schema.columns
+     WHERE table_schema IN ('public', 'spread')`);
+  const knownColumns = new Set(cols.map((r) => r.c));
+
+  const findings = [];
+  let scanned = 0;
+  for (const f of files) {
+    const raw = fs.readFileSync(f, 'utf8');
+
+    /**
+     * ONLY INSIDE SQL, and only where SQL actually lives.
+     *
+     * The first pass matched "read FROM the terminal" in a comment and
+     * reported `the` as a missing table — 105 findings, all prose. A word
+     * after FROM is only a table when it is inside a query.
+     *
+     * So: template literals and quoted strings that contain SELECT, INSERT,
+     * UPDATE or DELETE. Everything else in the file is not SQL.
+     */
+    const queries = [];
+    for (const m of raw.matchAll(/`([\s\S]*?)`|'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g)) {
+      const body = m[1] || m[2] || m[3] || '';
+      if (/\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b/i.test(body)) queries.push(body);
+    }
+    /**
+     * MIGRATIONS ARE NOT SCANNED.
+     *
+     * A migration names tables at the moment it ran: 002 renames live_quotes to
+     * awsat_market_quotes, so the old name appears and correctly no longer
+     * exists. Reporting that is reporting history as a defect — and an applied
+     * migration cannot be edited anyway.
+     */
+    if (f.endsWith('.sql')) continue;
+    const src = queries.join('\n');
+    if (!src) continue;
+
+    // CTE names are defined in the query itself, not in the database. Taken
+    // from the RAW file, not from the extracted queries: an apostrophe in a
+    // comment can desynchronise the string stripper and split one WITH chain
+    // across two chunks, and then `m AS (` and `FROM m` were in different
+    // pieces — the stats job's `m` was reported as a missing table.
+    const ctes = new Set([...raw.matchAll(/\b([a-z_][\w]*)\s+AS\s*\(/gi)].map((m) => m[1].toLowerCase()));
+    // So are aliases: FROM x AS y, JOIN a b — the second word is a name for
+    // the first, not another table.
+    for (const m of src.matchAll(/\b(?:FROM|JOIN)\s+((?:[a-z_]+\.)?[a-z_]+)/gi)) {
+      const name = m[1].toLowerCase();
+      scanned += 1;
+      if (exists.has(name)) continue;
+      if (ctes.has(name)) continue;                       // a CTE, not a table
+      if (!name.includes('.') && exists.has(`public.${name}`)) continue;
+      if (allowed(allow, 'reads', name)) continue;
+      // SQL keywords that can follow FROM or JOIN: LATERAL, a comment word
+      // inside a query, an ordinal. None is a table.
+      if (SQL_AFTER_FROM.has(name)) continue;
+      // System catalogues are not in information_schema.tables for the two
+      // schemas this queries, and they always exist.
+      if (/^(information_schema|pg_catalog)\./.test(name) || /^pg_/.test(name)) continue;
+      // `alias.column` — an ORDER BY or a correlated reference that followed a
+      // FROM on the previous line. A real table reference has a SCHEMA before
+      // the dot, and only public and spread are in scope.
+      if (name.includes('.') && !/^(public|spread)\./.test(name)) continue;
+      // A bare word that is a COLUMN somewhere is a wrapped ORDER BY or a
+      // correlated reference, not a table. `created_at` and `last_qty` are
+      // columns; no table is named either.
+      if (!name.includes('.') && knownColumns.has(name)) continue;
+      findings.push({ name, file: path.relative(ROOT, f) });
+    }
+  }
+  // One entry per name: the same missing table in nine places is one problem.
+  const seen = new Set();
+  return {
+    findings: findings.filter((x) => !seen.has(x.name) && seen.add(x.name)),
+    scanned,
+  };
+}
+
 // ── 2 · TABLES WITH NO INSERT ──────────────────────────────────────────────
 async function scanTables(query, files, allow) {
   const { rows } = await query(`
@@ -400,6 +541,12 @@ async function scan({ query = null, entryPoints = [] } = {}) {
     say('  tables with no INSERT   (warns, never fails)');
     say(`    ${t.scanned} scanned · ${t.findings.length} with no INSERT · ${t.allowed} allowed`);
     for (const f of t.findings) say(`    WARN ${f.name}`);
+    say('');
+
+    const rd = await scanReads(query, files, allow);
+    say('  tables READ that do not exist   (warns, never fails)');
+    say(`    ${rd.scanned} FROM/JOIN target(s) · ${rd.findings.length} missing`);
+    for (const f of rd.findings) say(`    WARN ${f.name}  read in ${f.file}`);
     say('');
 
     const c = await scanColumns(query, files, allow);
