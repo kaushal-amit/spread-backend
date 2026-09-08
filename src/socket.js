@@ -146,6 +146,8 @@ async function view(day, budgetKd) {
     recommended: screen.recommended.map((x) => present.stockCandidate(x, budgetKd)),
     nearMiss: screen.nearMiss.map((x) => present.stockCandidate(x, budgetKd)),
     rejected: screen.rejected.map((x) => present.stockCandidate(x, budgetKd)),
+    // SPR-38 · NOT COMPUTED is its own bucket, never folded into rejected.
+    notComputed: (screen.notComputed || []).map((x) => present.stockCandidate(x, budgetKd)),
     counts: screen.counts,
     reach: screen.reach,
     session: sessionPhase(),

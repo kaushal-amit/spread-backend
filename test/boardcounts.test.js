@@ -27,7 +27,10 @@ const NOQ = 'SZTESTNOQ', NOS = 'SZTESTNOS';
     await fx.quote(NOS, { day: DAY, at: `${DAY}T06:00:00Z`, last: 200, bid: 199, offer: 201 });
 
     const b = await screening.screen(DAY, 2000, { cfg: GATES });
-    const all = [...b.recommended, ...b.nearMiss, ...b.rejected];
+    // SPR-38 · the board now has a NOT COMPUTED bucket; NOQ/NOS (which fail only
+    // on missing stats) live there rather than in rejected. Rebuild the full
+    // list from all four buckets — the same shape the board now returns.
+    const all = [...b.recommended, ...b.nearMiss, ...b.rejected, ...b.notComputed];
     const noq = all.find((r) => r.symbol === NOQ);
     const nos = all.find((r) => r.symbol === NOS);
 

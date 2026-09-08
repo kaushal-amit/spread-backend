@@ -105,8 +105,13 @@ const FLAG_LABEL = {
  * the section. They must never be collapsed into one.
  */
 function stockCandidate(r, budgetKd) {
+  // SPR-38 · a card whose only failures are NOT COMPUTED gates is its own
+  // status — never counted as rejected. A real failure is a failed gate not in
+  // the notComputed set.
+  const realFailedCount = (r.failed || []).filter((f) => !(r.notComputed || []).includes(f)).length;
   // Same ordering for the section: a structural failure is never a near miss.
   const status = r.passed ? 'recommended'
+    : (!r.passed && r.failed.length > 0 && realFailedCount === 0) ? 'not_computed'
     : (!r.structural && r.failed.length === 1) ? 'near_miss'
     : 'rejected';
 

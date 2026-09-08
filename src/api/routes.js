@@ -280,7 +280,7 @@ function build() {
   r.get('/stocks', async (req, res) => {
     try {
       const b = await board(day(req), budget(req));
-      res.json([...b.recommended, ...b.nearMiss, ...b.rejected]
+      res.json([...b.recommended, ...b.nearMiss, ...b.rejected, ...(b.notComputed || [])]
         .map((x) => present.stockCandidate(x, budget(req))));
     } catch (e) { fail(res)(e); }
   });
@@ -289,7 +289,7 @@ function build() {
     try {
       const sym = symbolParam(req.params.symbol);
       const b = await board(day(req), budget(req));
-      const hit = [...b.recommended, ...b.nearMiss, ...b.rejected]
+      const hit = [...b.recommended, ...b.nearMiss, ...b.rejected, ...(b.notComputed || [])]
         .find((x) => x.symbol.toUpperCase() === sym);
       res.json(hit ? present.stockCandidate(hit, budget(req)) : null);
     } catch (e) { fail(res)(e); }
@@ -407,7 +407,7 @@ function build() {
     const d = day(req);
     const bkd = budget(req);
     const b = await board(d, bkd);
-    const hit = [...b.recommended, ...b.nearMiss, ...b.rejected].find((x) => x.symbol === sym);
+    const hit = [...b.recommended, ...b.nearMiss, ...b.rejected, ...(b.notComputed || [])].find((x) => x.symbol === sym);
     const [book, sizing, fill, depthSig, contractsAll, legsRows, lastMove] = await Promise.all([
       orderBookFor(sym, d),
       require('./sizing').sizingFor(sym).catch((e) => ({ error: e.message, code: e.code || 'SIZING' })),

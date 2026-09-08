@@ -171,18 +171,34 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
     r.m45Reason = row ? row.reason : null;
   }
 
+  /*
+   * SPR-38 · THREE BUCKETS, NOT TWO. A gate that could not be computed (its
+   * statistic is missing) is not a failed stock — so a card that fails ONLY on
+   * NOT COMPUTED gates belongs in its own bucket, never in `rejected`. Filing
+   * all 140 under "140 rejected" beside a card reading NOT COMPUTED is what made
+   * the whole board untrustworthy.
+   *
+   * A real failure is a failed gate that is NOT in the notComputed set.
+   */
+  const realFailed = (r) => r.failed.filter((f) => !(r.notComputed || []).includes(f));
+  const isPureNotComputed = (r) => !r.passed && r.failed.length > 0 && realFailed(r).length === 0;
+
   const reachable = results.filter((r) => r.reachable);
   const recommended = funnel.rank(reachable.filter((r) => r.passed));
-  const nearMiss = funnel.rank(reachable.filter((r) => !r.passed && r.failed.length === 1));
+  const notComputed = reachable.filter(isPureNotComputed);
+  const decided = reachable.filter((r) => !r.passed && !isPureNotComputed(r)); // has a real failure
+  const nearMiss = funnel.rank(decided.filter((r) => r.failed.length === 1));
   // By what they WOULD have paid, descending. A well-paying rejection belongs
   // where it gets read.
-  const rejected = results
-    .filter((r) => !r.passed && r.failed.length > 1)
+  const rejected = decided
+    .filter((r) => r.failed.length > 1)
     .sort((a, b) => (b.netAtTarget.netKd ?? -Infinity) - (a.netAtTarget.netKd ?? -Infinity));
 
   const counts = { all: results.length, recommended: recommended.length,
-    nearMiss: nearMiss.length, rejected: rejected.length };
-  for (const r of results) for (const f of r.failed) counts[f] = (counts[f] || 0) + 1;
+    nearMiss: nearMiss.length, rejected: rejected.length, notComputed: notComputed.length };
+  // Failures by gate counts REAL failures only — a NOT COMPUTED gate is a
+  // missing number, not a failed stock, and must not swell the tally.
+  for (const r of results) for (const f of realFailed(r)) counts[f] = (counts[f] || 0) + 1;
   // R-38 · why a gate could not be computed, split so TODAY can say which fix
   // applies. No live quote this session is a scraper/market question; a quote
   // present with no gate-statistics source is "stats:daily has not run". The
@@ -191,7 +207,7 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
   counts.noStats = results.filter((r) => r.quoteAt != null && !r.gateStatsSource).length;
 
   return {
-    tradingDay, budgetKd, recommended, nearMiss, rejected, counts,
+    tradingDay, budgetKd, recommended, nearMiss, rejected, notComputed, counts,
     reach: {
       reachable: reachable.length, total: results.length,
       at2500: results.filter((r) => r.minBudgetKd == null || r.minBudgetKd <= 2500).length,

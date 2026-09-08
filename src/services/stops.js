@@ -144,9 +144,73 @@ function sessionStops(closed, now, t) {
   };
 }
 
+/**
+ * SPR-37 · 13:30 IS THE END OF THE TRADING DAY. Nothing evaluates after it.
+ *
+ * The market gate used to run on the wall clock and on
+ * awsat_market_summary.session_state, which stays 'LIVE' after the close — so
+ * the engine kept computing a fresh breadth-drop STOP every minute on a frozen
+ * market (13:09–13:14, six identical lines). The exchange itself tells us the
+ * phase: awsat_market_quotes.session carries
+ *   09:00–12:59  Trading
+ *   13:00–13:09  Close Auction Acceptance
+ *   13:10–13:14  Trading at Last
+ *   13:15–13:30  Close-Of-Day
+ * so the engine reads that column instead of inferring. 'Trading' — or NULL,
+ * the July capture defect — means evaluate; any other phase means the day is
+ * over. And nothing runs past 13:30 regardless: a capture left running still
+ * tagged 'Trading' past the close (as happened at 14:51) is still closed.
+ *
+ * The reading must be RECENT (within 15 min of `now`) to count — a stale row
+ * from earlier or another symbol never decides the current phase; with no
+ * recent reading the phase is NULL and the engine evaluates as before.
+ */
+const TRADING_DAY_END_MINS = 13 * 60 + 30;
+
+async function marketPhase(day, now, db = pool) {
+  const { rows: [r] } = await db.query(
+    `SELECT session FROM public.awsat_market_quotes
+      WHERE trading_date = $1::date AND created_at <= $2
+        AND created_at >= $2::timestamptz - interval '15 minutes'
+      ORDER BY created_at DESC LIMIT 1;`, [day, now]);
+  return r ? (r.session ?? null) : null; // NULL = no recent reading / capture defect → evaluate
+}
+
+/** Is the trading day over, per the exchange phase and the 13:30 hard rule? */
+function isClosed(phase, nowMins) {
+  if (phase != null && phase !== 'Trading') return true;          // Close Auction / Trading at Last / Close-Of-Day
+  if (phase === 'Trading' && nowMins >= TRADING_DAY_END_MINS) return true; // a capture left running past the close
+  return false;
+}
+
 /** Everything the session needs: rows from the database, rules from above. */
 async function evaluate(day, { db = pool, now = testNow() } = {}) {
   const t = await thresholds(db);
+
+  // SPR-37 · read the exchange phase first. Once the day is over, do not
+  // evaluate breadth at all — return a single CLOSED verdict, no per-minute
+  // recomputation, so the feed and the banner stop churning STOP lines.
+  const phase = await marketPhase(day, now, db);
+  const nowMinsEarly = kuwaitMins(now);
+  if (isClosed(phase, nowMinsEarly)) {
+    const reason = phase && phase !== 'Trading'
+      ? `the market is closed (${phase}) — the trading day is over`
+      : 'past 13:30 — the trading day is over';
+    return {
+      day: toDay(day), now: new Date(now).toISOString(), clock: minsToClock(nowMinsEarly),
+      market: { verdict: 'closed', reason, breadthPct: null, at: null, dropPts: null, hourAgo: null,
+        rising: null, readings: { '0900': null, '0930': null, '1000': null }, captures: 0 },
+      losses: sessionStops([], now, t),
+      flatBy: minsToClock(hhmmToMins(t.flat_by_hhmm)), pastFlatBy: true,
+      mode: 'closed', canOpen: false, maxTargetTicks: null,
+      reasons: [reason], warnings: [],
+      marketPhase: phase, closed: true,
+      timeStops: [], timeStopMins: Number(t.time_stop_mins ?? 20),
+      holdToFlat: [], holdToFlatBy: Number(t.exit_hold_to_flat ?? 1) === 1,
+      thresholds: t,
+    };
+  }
+
   const { rows: summary } = await db.query(
     `SELECT captured_at AS at, symbols_traded AS "symbolsTraded", advancing, declining, unchanged
        FROM public.awsat_market_summary
@@ -201,6 +265,7 @@ async function evaluate(day, { db = pool, now = testNow() } = {}) {
     mode, canOpen: reasons.length === 0,
     maxTargetTicks: mode === 'careful' ? t.careful_max_target_ticks : null,
     reasons, warnings,
+    marketPhase: phase, closed: false,
     // R-21 · the 20-minute time stop, per open position. Informational — hit-bid
     // is the action, there is no auto-sell.
     timeStops: timeStopsList, timeStopMins: Number(t.time_stop_mins ?? 20),
@@ -298,4 +363,4 @@ async function timeStops(day, { db = pool, now = testNow(), t } = {}) {
   return out;
 }
 
-module.exports = { marketGate, sessionStops, evaluate, timeStops, holdToFlat, thresholds, KEYS, kuwaitMins, minsToClock };
+module.exports = { marketGate, sessionStops, evaluate, timeStops, holdToFlat, thresholds, KEYS, kuwaitMins, minsToClock, marketPhase, isClosed, TRADING_DAY_END_MINS };
