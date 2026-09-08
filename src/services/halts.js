@@ -346,6 +346,21 @@ async function latestCapture(tradingDay, db = pool) {
  * else slot_refused_reason; a network error/timeout → SCRAPER_UNREACHABLE. The
  * halt still alerts whatever happens. Returns { applied, slot, replaced, reason }.
  */
+/**
+ * H-D1 · record a TRADEABLE resume's delivery attempt on its halt_event row, so
+ * "was UPAC sent?" is a query. `channel` is always set (the provider, or
+ * 'console' when none is configured); `deliveredAt` is set only on success;
+ * `error` names why it did not go out. A row left with all three NULL is a
+ * delivery that was never attempted — the defect H-D1 closes.
+ */
+async function recordDelivery(haltId, { channel, deliveredAt = null, error = null } = {}, db = pool) {
+  if (haltId == null) return;
+  await db.query(
+    `UPDATE spread.halt_event
+        SET delivery_channel = $2, delivered_at = $3, delivery_error = $4
+      WHERE id = $1;`, [haltId, channel || null, deliveredAt, error]);
+}
+
 async function applyHaltSlot(client, decision, symbol, haltId, db) {
   if (!decision || decision.displace == null) {
     const reason = decision ? decision.reason : 'no slot decision';
@@ -579,5 +594,5 @@ async function skipListQuery(db = pool) {
 }
 
 module.exports = { sessionClass, transitions, sharesAt, verdict, haltBandFloor, payload,
-  priceBefore, priorClose, history, slotSwapDecision, applyHaltSlot, recoverState, backfill, skipListQuery,
+  priceBefore, priorClose, history, slotSwapDecision, applyHaltSlot, recordDelivery, recoverState, backfill, skipListQuery,
   latestCapture, poll, thresholds, KEYS, DEFAULTS };

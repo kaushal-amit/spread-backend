@@ -601,21 +601,32 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
         // THE ALERT. The verdict is already computed — two minutes is the trade.
         io.to(roomId).emit('spread:halt', { phase: 'RESUME', audible: res.tradeable, ...res });
         log.info(`[halt] ${res.symbol} resumed ${res.resumePrice} — ${res.verdict}`);
-        // The phone push. Only TRADEABLE resumes go to WhatsApp — the window is
-        // ~2 minutes and you cannot be watching every symbol. Bounded and never
-        // throwing; a failed push is surfaced to the terminal, not swallowed.
-        if (res.tradeable && whatsapp.enabled()) {
-          whatsapp.sendResume(res).then((wr) => {
-            if (!wr.ok) {
-              log.warn(`[halt] WhatsApp push failed for ${res.symbol}: ${wr.reason || (wr.results || []).map((x) => x.error).join('; ')}`);
-              io.to(roomId).emit('spread:whatsappFailed', {
-                symbol: res.symbol, reason: wr.reason || 'send failed',
-                text: `WhatsApp push for ${res.symbol} did not go out — check the gateway`,
-              });
+        // H-D1 · THE DELIVERY PATH. Every TRADEABLE resume attempts delivery
+        // within this scan and the attempt is RECORDED on the halt_event row, so
+        // "was UPAC sent?" is a query. Attempted whether or not a provider is
+        // configured: with none, send() logs the exact line it WOULD have sent
+        // and the row records channel 'console' with the reason — nothing silent.
+        // Bounded and never throwing; a real failure raises to the terminal.
+        if (res.tradeable) {
+          whatsapp.sendResume(res).then(async (wr) => {
+            const channel = wr.provider || 'console';
+            const err = wr.ok ? null
+              : (wr.reason || (wr.results || []).map((x) => x.error).filter(Boolean).join('; ') || 'send failed');
+            await halts.recordDelivery(res.id, {
+              channel, deliveredAt: wr.ok ? new Date() : null, error: err,
+            }).catch((e) => log.warn('[halt] delivery stamp failed', e.message));
+            if (wr.ok) {
+              log.info(`[halt] delivered ${res.symbol} via ${channel} (${wr.sent} recipient${wr.sent === 1 ? '' : 's'})`);
             } else {
-              log.info(`[halt] WhatsApp push sent for ${res.symbol} (${wr.sent} recipient${wr.sent === 1 ? '' : 's'})`);
+              log.warn(`[halt] ${res.symbol} NOT delivered (${channel}): ${err}`);
+              io.to(roomId).emit('spread:whatsappFailed', {
+                symbol: res.symbol, reason: err, channel,
+                text: wr.reason === 'WHATSAPP_UNCONFIGURED'
+                  ? `no WhatsApp provider configured — logged, not sent: ${whatsapp.alertText(res)}`
+                  : `WhatsApp push for ${res.symbol} did not go out — check the gateway`,
+              });
             }
-          }).catch((e) => log.warn('[halt] WhatsApp push error', e.message));
+          }).catch((e) => log.warn('[halt] delivery error', e.message));
         }
       }
       // A4 · a slot whose depth capture has gone stale (>10 min) during the

@@ -6,14 +6,17 @@
 // This service sends ONE line — "SLTB resumed 142 · TRADEABLE · target 147 stop
 // 137" — for every TRADEABLE resume the detector computes.
 //
-// Two providers, chosen by WHATSAPP_PROVIDER:
+// Providers, chosen by WHATSAPP_PROVIDER:
+//   · gupshup — Gupshup's WhatsApp API (api.gupshup.io). The chosen provider
+//              (Amit, 8 Sep): one operator, one number. Form-POST with an apikey
+//              header; a plain text message from an approved source number.
 //   · meta   — the WhatsApp Cloud API (graph.facebook.com). The message MUST be
 //              a pre-approved template unless the recipient messaged you in the
 //              last 24 hours; free-form text outside that window is dropped by
 //              Meta. So the template path sends a named template with the alert
 //              line as its one body parameter.
 //   · twilio — Twilio's WhatsApp API (api.twilio.com). Free-form body works from
-//              a Twilio sandbox or an approved sender; simpler to stand up.
+//              a Twilio sandbox or an approved sender.
 //   · console (default when nothing is configured) — logs the line and returns
 //              ok:false, reason:'WHATSAPP_UNCONFIGURED'. NOTHING SILENT: an
 //              unconfigured install still leaves a log line for every alert.
@@ -44,6 +47,10 @@ function config() {
     twilioSid: process.env.WHATSAPP_TWILIO_SID || null,
     twilioToken: process.env.WHATSAPP_TWILIO_TOKEN || null,
     twilioFrom: process.env.WHATSAPP_TWILIO_FROM || null, // e.g. whatsapp:+14155238886
+    // gupshup
+    gupshupApiKey: process.env.WHATSAPP_GUPSHUP_APIKEY || null,
+    gupshupSource: process.env.WHATSAPP_GUPSHUP_SOURCE || null, // the approved WA source number
+    gupshupApp: process.env.WHATSAPP_GUPSHUP_APP || null,       // the Gupshup app name (src.name)
   };
 }
 
@@ -51,6 +58,7 @@ function config() {
 function enabled() {
   const c = config();
   if (!c.to.length) return false;
+  if (c.provider === 'gupshup') return !!(c.gupshupApiKey && c.gupshupSource && c.gupshupApp);
   if (c.provider === 'meta') return !!(c.metaPhoneId && c.metaToken);
   if (c.provider === 'twilio') return !!(c.twilioSid && c.twilioToken && c.twilioFrom);
   return false;
@@ -86,6 +94,32 @@ async function postMeta(c, to, text) {
   let body = null; try { body = await res.json(); } catch { /* not json */ }
   const id = body && body.messages && body.messages[0] && body.messages[0].id;
   return { ok: res.ok, status: res.status, id: id || null, body };
+}
+
+async function postGupshup(c, to, text) {
+  // Gupshup enterprise WhatsApp API: form-POST, apikey header, a plain text
+  // message from the approved source number. `destination` is the E.164 number
+  // without a leading '+', which is what Gupshup expects.
+  const url = 'https://api.gupshup.io/wa/api/v1/msg';
+  const dest = String(to).replace(/^\+/, '');
+  const form = new URLSearchParams({
+    channel: 'whatsapp',
+    source: String(c.gupshupSource).replace(/^\+/, ''),
+    destination: dest,
+    'src.name': c.gupshupApp,
+    message: JSON.stringify({ type: 'text', text }),
+  });
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { apikey: c.gupshupApiKey, 'content-type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+    signal: c._signal,
+  });
+  let body = null; try { body = await res.json(); } catch { /* not json */ }
+  // Gupshup returns { status: 'submitted', messageId } on success.
+  const id = body && (body.messageId || body.message_id) ? (body.messageId || body.message_id) : null;
+  const ok = res.ok && (!body || body.status !== 'error');
+  return { ok, status: res.status, id, body };
 }
 
 async function postTwilio(c, to, text) {
@@ -135,7 +169,9 @@ async function send(text, { to: toOverride } = {}) {
   try {
     for (const to of recipients) {
       try {
-        const r = c.provider === 'meta' ? await postMeta(c, to, text) : await postTwilio(c, to, text);
+        const r = c.provider === 'gupshup' ? await postGupshup(c, to, text)
+          : c.provider === 'meta' ? await postMeta(c, to, text)
+          : await postTwilio(c, to, text);
         if (!r.ok) log.warn('[whatsapp] send rejected', { to, status: r.status, body: r.body });
         results.push({ to, ok: r.ok, status: r.status, id: r.id, error: r.ok ? null : `HTTP ${r.status}` });
       } catch (e) {
