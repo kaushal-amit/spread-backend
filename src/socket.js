@@ -472,9 +472,27 @@ function startWakeupScanner(io, { times = WAKE_TIMES, everyMs = 60000 } = {}) {
  * ten opportunities in one session.
  */
 function startAlertScanner(io, { everyMs = 60000 } = {}) {
+  /*
+   * SPR-24 · THE OPEN-WINDOW MAP.
+   *
+   * `${day}:${symbol}` -> { alertId, audible }. A window is INSERTED once, when
+   * it opens, and CLOSED once, when the symbol stops qualifying — at which point
+   * closeWindow() stamps window_closed_at and window_seconds. This is what the
+   * cooldown could never do: cooldown suppressed re-fires but never recorded a
+   * duration, so every window_seconds was NULL. Dedup is the map, not a timer,
+   * so a window that closes and genuinely reopens later is a NEW row (correct —
+   * the claim under test is 3.3-minute windows, several per session).
+   */
+  const open = new Map();
   return setInterval(async () => {
     const phase = sessionPhase();
-    if (!phase.open) return;
+    if (!phase.open) {
+      // The session closed with windows still open — close them at the bell so
+      // their duration is recorded rather than left dangling to tomorrow.
+      for (const [, o] of open) await alerts.closeWindow(o.alertId).catch(() => {});
+      open.clear();
+      return;
+    }
     const day = daily.kuwaitDay();
     try {
       const { rows } = await pool.query(
@@ -497,15 +515,35 @@ function startAlertScanner(io, { everyMs = 60000 } = {}) {
         `SELECT symbol FROM public.depth_watchlist
           WHERE trading_date = $1 AND released_at IS NULL
           ORDER BY slot_no;`, [day]);
+      const qualifying = new Set();
       for (const { symbol } of rows) {
         const r = await alerts.evaluate(symbol, day, {
           budgetKd: require('./services/gateStore').sessionBudgetKd() }).catch(() => null);
-        if (r?.fire) {
-          const id = await alerts.fire(r, day);
-          // AUDIBLE. A silent alert for a 3-minute window is not an alert.
-          io.to(room(day)).emit('spread:entryAlert', { ...r, alertId: id, audible: ALERT.audible });
-          log.info(`[alert] ${symbol} — spread ${r.spreadFils}, fill ~${r.estFillMins}m`);
-        }
+        if (!r?.windowOpen) continue;
+        const key = `${day}:${r.symbol}`;
+        qualifying.add(key);
+        if (open.has(key)) continue;   // same window still open — one row per window
+        // A new window. Record it either way; the depth veto (SPR-06/23) only
+        // decides whether the PHONE rings.
+        const id = await alerts.fire(r, day, {
+          suppressed: r.depthVeto, suppressedReason: r.vetoReason });
+        open.set(key, { alertId: id, audible: r.audible });
+        io.to(room(day)).emit('spread:entryAlert', {
+          ...r, alertId: id,
+          // AUDIBLE only for a clean window. A vetoed one goes to the feed
+          // marked held, never to the phone.
+          audible: r.audible ? ALERT.audible : false,
+          suppressed: r.depthVeto, suppressedReason: r.vetoReason });
+        log.info(r.audible
+          ? `[alert] ${r.symbol} — spread ${r.spreadFils}, fill ~${r.estFillMins}m`
+          : `[alert] ${r.symbol} — window open but ${r.vetoReason}`);
+      }
+      // Any window we were tracking that no longer qualifies has CLOSED.
+      for (const [key, o] of open) {
+        if (qualifying.has(key)) continue;
+        await alerts.closeWindow(o.alertId).catch(() => {});
+        open.delete(key);
+        io.to(room(day)).emit('spread:entryAlertClosed', { alertId: o.alertId });
       }
     } catch (e) { log.warn('[alert]', e.message); }
   }, everyMs);

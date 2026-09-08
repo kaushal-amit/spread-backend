@@ -135,6 +135,25 @@ const timers = []; // interval handles, cleared on shutdown
     const ph = await require('./services/phrases').load();
     log.info(`[boot] ladder phrases: ${Object.keys(ph).length} loaded`);
 
+    /*
+     * SPR-25 · the halt-swap path is only as alive as SCRAPER_INGEST_URL. Unset,
+     * every halt swap dies as a slot_refused_reason nobody reads until a halt
+     * happens. Say it LOUDLY at boot and raise a data_alarm so /health and the
+     * diag feed carry it now — the loud failure, not the silent value.
+     */
+    if (!require('./services/scraperClient').configured) {
+      log.warn('[boot] SCRAPER_INGEST_URL is UNSET — halt slot swaps cannot reach the scraper; ' +
+               'set it (e.g. http://127.0.0.1:8080/ingest) or every halt records SCRAPER_URL_UNSET');
+      await pool.query(
+        `INSERT INTO spread.data_alarm (trading_day, table_name, alarm, detail)
+         VALUES (CURRENT_DATE, 'config', 'SCRAPER_URL_UNSET', $1)
+         ON CONFLICT (table_name, alarm, COALESCE(trading_day, '0001-01-01'::date),
+                      COALESCE(column_name, ''), COALESCE(symbol, '')) WHERE resolved_at IS NULL DO NOTHING;`,
+        [JSON.stringify({ env: 'SCRAPER_INGEST_URL',
+          note: 'unset — the halt-resume slot swap has no endpoint to call; every swap records SCRAPER_URL_UNSET' })])
+        .catch((e) => log.warn('[boot] scraper-url alarm', e.message));
+    }
+
     server.listen(PORT, () => log.info(`[boot] SPREAD listening on ${PORT}`, { port: PORT }));
     timers.push(startTicker(io));
     timers.push(startWakeupScanner(io));

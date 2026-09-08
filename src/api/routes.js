@@ -189,6 +189,10 @@ function build() {
       const staleSlots = await require('../services/slots').staleSlots(daily.kuwaitDay(), { now: t.t })
         .then((s) => s.length).catch(() => null);
       const body = present.health({ now: t.t, latestQuoteAt: t.latest_quote_at, latestStatsDay: t.latest_stats_day, statsSource: t.stats_source, session, staleSlots });
+      // SPR-25 · the halt-swap endpoint's liveness, visible before a halt needs
+      // it. Unset is not a 503 (the terminal still works) but it is SHOWN.
+      const scraperConfigured = require('../services/scraperClient').configured;
+      body.scraperIngest = scraperConfigured ? 'configured' : 'SCRAPER_URL_UNSET — halt slot swaps cannot reach the scraper';
       res.status(body.status === 'stale' ? 503 : 200).json(body);
     } catch (e) { res.status(503).json({ status: 'down', code: 'DB_DOWN', error: 'the database is not reachable' }); }
   });

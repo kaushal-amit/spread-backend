@@ -56,4 +56,10 @@ async function depthSymbols() {
   } catch { return null; } finally { clearTimeout(timer); }
 }
 
-module.exports = { applySlot, depthSymbols, BASE };
+// SPR-25 · whether the halt-swap path can reach the scraper at all. Read at
+// boot (index.js) to surface an unset URL loudly, and by /health so the dead
+// path is visible before a halt needs it — not only as a slot_refused_reason
+// after the fact.
+const configured = !!BASE;
+
+module.exports = { applySlot, depthSymbols, BASE, configured };

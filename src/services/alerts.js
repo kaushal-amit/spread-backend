@@ -72,39 +72,73 @@ async function evaluate(symbol, tradingDay, {
   const depthBuy = sig?.signal === 'BUY' && sig.sampleSufficient;
   const depthBlocked = sig?.signal === 'BLOCKED';
 
-  const fire = !depthBlocked && ((roomOk && exitOk && fillOk) || (depthBuy && exitOk && fillOk));
+  /*
+   * SPR-06/23 · THE DEPTH VETO.
+   *
+   * `windowOpen` is the raw fact: the spread has room (or a BUY depth relaxes
+   * that) and the offer is reachable and the queue clears. It is computed
+   * WITHOUT the cooldown so the scanner can measure the window's open→close
+   * duration itself; cooldown-based dedup is what left every window NULL.
+   *
+   * A depth read that HAS DATA (a sufficient sample) and is NOT a BUY vetoes the
+   * PHONE — SELL and WAIT are not things to chase in a two-minute window — but
+   * the window is still real, so it is recorded with the reason it was held.
+   * This subsumes the old BLOCKED-only veto. A null/insufficient depth read does
+   * not veto: spread-only alerting is unchanged where depth has nothing to say.
+   */
+  const windowOpen = (roomOk && exitOk && fillOk) || (depthBuy && exitOk && fillOk);
+  const depthHasData = !!sig && sig.signal != null && sig.sampleSufficient === true;
+  const depthVeto = windowOpen && depthHasData && !depthBuy;
+  const vetoReason = depthVeto
+    ? `held off the phone — depth ${sig.signal} (only a BUY depth alerts; recorded in the feed)`
+    : null;
+  // Audible = the window is open AND depth did not veto it.
+  const audible = windowOpen && !depthVeto;
 
   const key = `${tradingDay}:${sym}`;
   const last = cooldown.get(key) || 0;
   const withinCooldown = now.getTime() - last < cfg.cooldownMinutes * 60000;
 
   return {
-    symbol: sym, fire: fire && !withinCooldown, suppressed: fire && withinCooldown,
+    symbol: sym,
+    // Kept for any caller that wants the cooldown-gated view. The scanner drives
+    // dedup off `windowOpen` + the open-window map instead (SPR-24).
+    fire: audible && !withinCooldown, suppressed: audible && withinCooldown,
+    windowOpen, audible, depthVeto, vetoReason,
     bidFils: bid, offerFils: offer, spreadFils: spread,
     offerShares: Number(q.offer_shares), myShares: shares,
     estFillMins: fill?.estFillMins ?? null,
     depthSignal: sig?.signal ?? null,
     depthSufficient: sig?.sampleSufficient ?? null,
-    checks: { roomOk, exitOk, fillOk, depthBuy, depthBlocked },
-    reason: !fire
-      ? (depthBlocked ? 'a wall overhead — deep on both sides is a standoff'
-        : !roomOk ? `spread ${spread} fil — no room to post inside and sell ${targetTicks} above`
+    checks: { roomOk, exitOk, fillOk, depthBuy, depthBlocked, depthHasData },
+    reason: !windowOpen
+      ? (!roomOk ? `spread ${spread} fil — no room to post inside and sell ${targetTicks} above`
         : !exitOk ? `offer ${Number(q.offer_shares).toLocaleString('en-US')} against your ${shares.toLocaleString('en-US')} — not reachable`
         : 'queue will not clear inside the window')
-      : null,
+      : vetoReason,
   };
 }
 
-/** Fire, record, and start the cooldown so one window produces one alert. */
-async function fire(result, tradingDay, { db = pool, targetTicks = 1, now = new Date() } = {}) {
+/**
+ * Fire, record, and start the cooldown so one window produces one alert.
+ *
+ * SPR-06/23 · `suppressed` records a window the depth veto kept off the phone,
+ * with the reason. The row is written either way — the difference is only
+ * whether the phone rang.
+ */
+async function fire(result, tradingDay, {
+  db = pool, targetTicks = 1, now = new Date(), suppressed = false, suppressedReason = null,
+} = {}) {
   cooldown.set(`${tradingDay}:${result.symbol}`, now.getTime());
   const { rows: [r] } = await db.query(
     `INSERT INTO spread.entry_alert
        (trading_day, symbol, bid_fils, offer_fils, spread_fils, offer_shares,
-        my_shares, est_fill_mins, target_ticks, depth_signal)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id;`,
+        my_shares, est_fill_mins, target_ticks, depth_signal,
+        suppressed, suppressed_reason)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id;`,
     [tradingDay, result.symbol, result.bidFils, result.offerFils, result.spreadFils,
-     result.offerShares, result.myShares, result.estFillMins, targetTicks, result.depthSignal]);
+     result.offerShares, result.myShares, result.estFillMins, targetTicks, result.depthSignal,
+     !!suppressed, suppressedReason]);
   return r.id;
 }
 
