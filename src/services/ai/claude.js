@@ -20,6 +20,7 @@
  */
 
 const { pool } = require('../../db');
+const log = require('../../lib/log');
 const boundary = require('./boundary');
 const tools = require('./tools');
 const schema = require('./schema');
@@ -288,6 +289,22 @@ async function ask({ symbol, tradingDay, question, position = null, tradingState
     clearTimeout(timer);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
+      // SPR-02 · the provider's body is the only thing that says WHY a 400
+      // happened (bad model id, tool schema, empty system…). Log it server-side
+      // rather than returning a bare "model call failed (400)" nobody can debug.
+      log.warn('[ai] model call failed', { status: res.status, model: MODEL, body: String(body).slice(0, 600) });
+      // SPR-29 · a refusal must leave a record. The success path writes ai_chat
+      // at the end of the exchange; a model error returned early here, so nothing
+      // was ever written and the failure could not be reviewed after the fact.
+      await db.query(
+        `INSERT INTO spread.ai_chat
+           (trading_day, symbol, question, answer, context_json, model, tool_calls,
+            tokens, unanswerable, tools_called, flagged)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [tradingDay, symbol, question || '',
+          `MODEL_ERROR ${res.status}: ${String(body).slice(0, 300)}`,
+          JSON.stringify({ modelError: true, status: res.status }),
+          MODEL, toolsCalled.length, null, true, toolsCalled, true]).catch(() => {});
       return { ok: false, code: 'MODEL_ERROR', text: `model call failed (${res.status})`, body };
     }
 
