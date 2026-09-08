@@ -43,6 +43,11 @@
       "name": "src/jobs/reconcile-fees.js",
       "reason": "run nightly by hand or by cron, not imported by the server. Will be wired to the scheduler when one exists.",
       "until": "2026-10-31"
+    },
+    {
+      "name": "src/db/seed-symbols.js",
+      "reason": "a by-hand shortcut (like seed-calendar.js), superseded and documented as such — it seeds the dropped spread.symbol from whatever traded, pending real Boursa listing data. Kept as the documented fallback; the spread.symbol reads entry below is its companion.",
+      "until": "2026-10-31"
     }
   ],
   "functions": [
