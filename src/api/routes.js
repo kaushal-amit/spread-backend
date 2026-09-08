@@ -193,8 +193,75 @@ function build() {
       // it. Unset is not a 503 (the terminal still works) but it is SHOWN.
       const scraperConfigured = require('../services/scraperClient').configured;
       body.scraperIngest = scraperConfigured ? 'configured' : 'SCRAPER_URL_UNSET — halt slot swaps cannot reach the scraper';
+      // SPR-30 · which capture feeds are actually arriving, so the header need
+      // never render a zero as data. Best-effort; a failure never fails health.
+      body.feeds = await require('../services/feedHealth').roster().catch(() => ({ available: false, scripts: [] }));
       res.status(body.status === 'stale' ? 503 : 200).json(body);
     } catch (e) { res.status(503).json({ status: 'down', code: 'DB_DOWN', error: 'the database is not reachable' }); }
+  });
+
+  /*
+   * ─── /feed · THE FEED REPLAYS FROM WHAT WAS RECORDED (SPR-07/08) ──────────
+   *
+   * The feed was live-socket-only and in-memory: on a reload it showed the boot
+   * line and nothing else, and the 76 entry_alert rows the server had recorded
+   * never appeared. This returns TODAY's recorded, feed-worthy events —
+   * entry-window alerts (SPR-07) and halt resumes — so the client seeds the feed
+   * on mount and history survives a reload (SPR-08).
+   *
+   * A suppressed entry (the depth veto, SPR-06/23) is INCLUDED and marked held —
+   * it belongs in the feed, off the phone. Newest first, to match the live feed.
+   */
+  r.get('/feed', async (req, res) => {
+    try {
+      const d = day(req);
+      const { rows: entries } = await pool.query(
+        `SELECT id, symbol, fired_at AS at, spread_fils, bid_fils, offer_fils,
+                offer_shares, my_shares, est_fill_mins, depth_signal,
+                suppressed, suppressed_reason, window_seconds
+           FROM spread.entry_alert
+          WHERE trading_day = $1 ORDER BY fired_at DESC LIMIT 200;`, [d]);
+      const { rows: halts } = await pool.query(
+        `SELECT id, symbol, detected_at AS at, resume_price_fils, verdict, verdict_detail
+           FROM spread.halt_event
+          WHERE trading_day = $1 AND kind = 'RESUME' ORDER BY detected_at DESC LIMIT 200;`, [d]);
+
+      const fmtShares = (n) => (n == null ? '?' : Number(n).toLocaleString('en-US'));
+      const events = [
+        ...entries.map((e) => ({
+          id: `ea-${e.id}`, kind: 'entry', symbol: e.symbol, at: e.at,
+          level: e.suppressed ? 'info' : 'hot',
+          title: e.suppressed
+            ? `ENTRY HELD · ${e.symbol} · depth ${e.depth_signal || '—'}`
+            : `ENTRY · SPREAD ${e.spread_fils}`,
+          body: e.suppressed
+            ? (e.suppressed_reason || `held off the phone — depth ${e.depth_signal}`)
+            : `Bid ${e.bid_fils} / offer ${e.offer_fils}. Offer ${fmtShares(e.offer_shares)} against your ` +
+              `${fmtShares(e.my_shares)}; fill ~${e.est_fill_mins == null ? '?' : e.est_fill_mins} min.` +
+              (e.window_seconds != null ? ` Window lasted ${e.window_seconds}s.` : ''),
+        })),
+        ...halts.map((h) => ({
+          id: `he-${h.id}`, kind: 'halt', symbol: h.symbol, at: h.at,
+          level: h.verdict === 'TRADEABLE' ? 'hot' : 'info',
+          title: `${h.symbol} resumed ${h.resume_price_fils ?? ''} — ${h.verdict || ''}`.trim(),
+          body: h.verdict_detail || '',
+        })),
+      ].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, 200);
+
+      res.json(events);
+    } catch (e) { fail(res)(e); }
+  });
+
+  /*
+   * SPR-30 · /feeds — the capture-feed roster for an honest header. Each
+   * EXPECTED script is ok / silent / absent, so the header can say "orders feed
+   * silent since 09:14" instead of a fabricated FLAT. `available:false` means
+   * the heartbeat table is not present here — the header shows "unknown", not
+   * "ok".
+   */
+  r.get('/feeds', async (_req, res) => {
+    try { res.json(await require('../services/feedHealth').roster()); }
+    catch (e) { fail(res)(e); }
   });
 
   // ---- stocks · IStockService ------------------------------------------

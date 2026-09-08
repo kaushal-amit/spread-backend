@@ -20,7 +20,7 @@ const daily = require('./jobs/daily');
 const { toResponse } = require('./api/errors');
 
 const { registerHandlers, startTicker, startWakeupScanner, startAlertScanner,
-  startRowPoller, startHaltScanner } = require('./socket');
+  startRowPoller, startHaltScanner, startFeedHealthScanner } = require('./socket');
 
 const PORT = Number(process.env.PORT || 4000);
 const app = express();
@@ -167,6 +167,9 @@ const timers = []; // interval handles, cleared on shutdown
     // all symbols; a down-halt resume is pushed as spread:halt with the verdict
     // already computed (the window is ~2 minutes).
     timers.push(startHaltScanner(io));
+    // SPR-27/30 · raise a data_alarm and push the roster when a capture feed
+    // (orders above all) goes silent or absent — the six-session blind spot.
+    timers.push(startFeedHealthScanner(io));
   } catch (e) {
     log.error('[boot] failed:', e.message);
     process.exit(1);

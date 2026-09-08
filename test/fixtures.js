@@ -282,6 +282,32 @@ function bind(pool) {
       return pool.query('DELETE FROM public.awsat_order_list WHERE symbol LIKE $1', [`${prefix}%`]);
     },
 
+    /**
+     * public.client_heartbeat — the scraper's per-cycle liveness record, which
+     * feedHealth reads (SPR-27/30). The table is created by the scraper's own
+     * migration, so a schema-only backend test DB may not have it; ensure it
+     * here (DDL, idempotent) and upsert one script's row. `secondsAgo` sets how
+     * stale last_seen_at is, so a suite can make a feed 'silent'. Test rows use
+     * source 'test' and are cleared by it, never touching a real heartbeat.
+     */
+    heartbeatTable: () => pool.query(
+      `CREATE TABLE IF NOT EXISTS public.client_heartbeat (
+         script text NOT NULL, source text NOT NULL DEFAULT 'awsat_client',
+         version text, rows_seen integer, problem text,
+         last_seen_at timestamptz NOT NULL DEFAULT now(),
+         PRIMARY KEY (script, source));`),
+    heartbeat: async (script, { secondsAgo = 0, rowsSeen = 0, problem = null, version = 'test' } = {}) => {
+      await pool.query(
+        `INSERT INTO public.client_heartbeat (script, source, version, rows_seen, problem, last_seen_at)
+         VALUES ($1, 'test', $2, $3, $4, now() - ($5 || ' seconds')::interval)
+         ON CONFLICT (script, source) DO UPDATE
+           SET version = EXCLUDED.version, rows_seen = EXCLUDED.rows_seen,
+               problem = EXCLUDED.problem, last_seen_at = EXCLUDED.last_seen_at;`,
+        [script, version, rowsSeen, problem, String(secondsAgo)]);
+    },
+    clearHeartbeats: () => pool.query("DELETE FROM public.client_heartbeat WHERE source = 'test'")
+      .catch(() => {}),
+
     /** public.signal_log / public.position — the review surface's sources. */
     signal: (sym, day, signal, price, wasRight) => {
       assertTestSymbol(sym);

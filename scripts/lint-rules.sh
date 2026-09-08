@@ -33,9 +33,9 @@ chk "tests write public.* only through test/fixtures.js" \
 # the check fails if fixtures.js writes a public.* table not named here, or stops
 # writing one that is.
 #   app_config · awsat_market_quotes · awsat_market_summary · awsat_order_list ·
-#   awsat_stock_depth · depth_watchlist · instruments · market_day · position ·
-#   signal_log · symbol_day · tradingview_history
-FIXTURE_PUBLIC_TABLES="app_config awsat_market_quotes awsat_market_summary awsat_order_list awsat_stock_depth depth_watchlist instruments market_day position signal_log symbol_day tradingview_history"
+#   awsat_stock_depth · client_heartbeat · depth_watchlist · instruments ·
+#   market_day · position · signal_log · symbol_day · tradingview_history
+FIXTURE_PUBLIC_TABLES="app_config awsat_market_quotes awsat_market_summary awsat_order_list awsat_stock_depth client_heartbeat depth_watchlist instruments market_day position signal_log symbol_day tradingview_history"
 DOC_SORTED=$(printf '%s\n' $FIXTURE_PUBLIC_TABLES | sort -u)
 ACTUAL_SORTED=$(grep -oE 'INSERT INTO public\.[a-z_]+' test/fixtures.js | sed -E 's/INSERT INTO public\.//' | sort -u)
 FIXTURE_MISMATCH=""

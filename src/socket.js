@@ -160,33 +160,32 @@ async function view(day, budgetKd) {
  * A stop is announced ONCE when it comes into force, and once when it lifts.
  * The tick re-evaluates every 15 s; the feed must not.
  */
+/*
+ * SPR-04/05 · THE BANNER IS THE ONLY SOURCE.
+ *
+ * This used to emit `spread:alert` lines on every breadth-mode change —
+ * STOP / CAREFUL / "Trading allowed again". Those transient lines were the
+ * "breadth re-arm lines": the banner showed one (and froze at the time it
+ * arrived), the feed accumulated the rest, and the two disagreed. Meanwhile the
+ * AUTHORITATIVE mode already rides every `spread:update` tick as `stops`
+ * (mode, canOpen, reasons) — a value that is always current, not a 14-second
+ * transient.
+ *
+ * So the mode is now shown ONCE, from the tick, by a persistent banner on the
+ * client. No re-arm lines. The transition is still LOGGED here (nothing
+ * silent), but it is no longer pushed as an alert that can go stale beside the
+ * live verdict.
+ */
 let lastStopKey = null;
-function announceStops(io, day, stops) {
+function announceStops(_io, day, stops) {
   if (!stops) return;
   const key = `${day}:${stops.mode}:${(stops.reasons || []).join('|')}`;
   if (key === lastStopKey) return;
   const was = lastStopKey;
   lastStopKey = key;
   if (was === null && stops.canOpen) return; // first tick of a normal day: nothing to say
-  const r = room(day);
-  if (!stops.canOpen) {
-    io.to(r).emit('spread:alert', {
-      kind: 'session_stop', level: 'danger',
-      title: stops.mode === 'cooloff' ? 'NO RE-ENTRY — 30 minutes after a loss' : stops.mode === 'careful' ? 'CAREFUL' : 'STOP — the day is over for new positions',
-      body: (stops.reasons || []).join(' · '), at: new Date().toISOString(),
-    });
-  } else if (stops.mode === 'careful') {
-    io.to(r).emit('spread:alert', {
-      kind: 'session_careful', level: 'warning',
-      title: 'CAREFUL — one position, take 2 fils',
-      body: stops.market?.reason || '', at: new Date().toISOString(),
-    });
-  } else {
-    io.to(r).emit('spread:alert', {
-      kind: 'session_stop_lifted', level: 'info',
-      title: 'Trading allowed again', body: stops.market?.reason || 'the stop no longer applies', at: new Date().toISOString(),
-    });
-  }
+  log.info(`[session] mode → ${stops.mode}${stops.canOpen ? '' : ' (no new positions)'}` +
+           ((stops.reasons || []).length ? ` · ${(stops.reasons || []).join(' · ')}` : ''));
 }
 
 /*
@@ -628,6 +627,28 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
   }, everyMs);
 }
 
+/*
+ * ─── SPR-27/30 · THE FEED-SILENCE SCANNER ───────────────────────────────────
+ *
+ * A capture feed that stops posting is invisible unless something is looking:
+ * the orders feed was silent for six sessions and nothing raised it. Every two
+ * minutes this reads the scraper's heartbeat roster, raises a data_alarm for
+ * any silent/absent feed (deduped once per feed per day), and pushes the roster
+ * as `spread:feedHealth` so the header updates live. Runs only while the market
+ * is open; where the heartbeat table is absent it is a no-op, never a crash.
+ */
+function startFeedHealthScanner(io, { everyMs = 120000 } = {}) {
+  const feedHealth = require('./services/feedHealth');
+  return setInterval(async () => {
+    if (!sessionPhase().open) return;
+    const day = daily.kuwaitDay();
+    try {
+      const r = await feedHealth.check(day);
+      if (r.available) io.to(room(day)).emit('spread:feedHealth', await feedHealth.roster());
+    } catch (e) { log.warn('[feedHealth]', e.message); }
+  }, everyMs);
+}
+
 module.exports = { registerHandlers, startTicker, startWakeupScanner, startAlertScanner,
   ruleAlerts, sessionPhase, view, watchedSymbols, watchedBySocket, startRowPoller, announceStops,
-  startHaltScanner };
+  startHaltScanner, startFeedHealthScanner };
