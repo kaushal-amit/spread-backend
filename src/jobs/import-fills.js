@@ -17,10 +17,17 @@
  *
  * What the broker list contains that a naive import gets wrong:
  *
- *   DUPLICATES  the client list and a synthetic reconstruction both record
- *               the same fill (SYN-… and a numeric id, same symbol, side,
- *               price, quantity and order_time). One fill, two rows. Deduped
- *               on that key; the row WITH a net_value wins.
+ *   DUPLICATES  the same fill is recorded under TWO ids — a broker numeric id
+ *               and a SYNTHETIC reconstruction (`syn:…` / `SYN-…`), because the
+ *               Order List grid shows the id column only intermittently, so one
+ *               capture reads the real id and another synthesises one. One fill,
+ *               two rows, and `order_time` is NULL on client rows so a key that
+ *               leans on it cannot see the twin. So the rule does NOT depend on
+ *               order_time: a synthetic row is dropped whenever a REAL row
+ *               exists for the same (symbol, side, price, shares, day). Two
+ *               REAL ids at that key are kept — they are distinct trades
+ *               (MUBARRAD's repeated round trips), never merged. Among
+ *               synthetics-only, one is kept and the net_value row wins.
  *   ORPHANS     a SELL with no open contract (KFIC 11 Aug: the buy predates
  *               capture; CATTL 291 on 24 Aug after the position closed). Not
  *               booked — a sell of shares the ledger never saw would open a
@@ -76,13 +83,32 @@ function brokerFee(r) {
  * @param {object[]} rows  awsat_order_list rows, any order
  * @param {object}   opts  { seqStart: {SYMBOL: n}, known: Set<order_id> }
  */
+const isSynthetic = (id) => /^(syn:|SYN-)/i.test(String(id || ''));
+/** The fill's natural key, WITHOUT order_time or id — same fill, same key. */
+const natKey = (r) => [r.symbol, r.side, Number(r.price), Number(r.shares), toDay(r.trading_date)].join('|');
+
 function plan(rows, { seqStart = {}, known = new Set() } = {}) {
   // 1 · dedupe
+  //
+  // The natural keys a REAL broker order fills. A synthetic reconstruction of
+  // any of them is the same fill under a second id and must not be booked
+  // twice — and because client rows carry no order_time, this cannot lean on
+  // a timestamp.
+  const realNat = new Set();
+  for (const r of rows) if (!isSynthetic(r.order_id)) realNat.add(natKey(r));
+
   const seen = new Map();
   const dropped = [];
   for (const r of rows) {
-    // A row without a time cannot be matched to its twin; it stands alone.
-    const key = r.order_time ? dupKey(r) : dupKey({ ...r, order_id_when_no_time: r.order_id });
+    // A synthetic row whose fill a REAL order already covers is a duplicate,
+    // whatever its id or (missing) time.
+    if (isSynthetic(r.order_id) && realNat.has(natKey(r))) { dropped.push(r.order_id); continue; }
+    // Distinct REAL ids are distinct trades and never merge (MUBARRAD's two
+    // round trips at one price). Timed rows still de-dupe an exact twin by
+    // (symbol,side,price,shares,day,time); synthetics-only collapse on the
+    // natural key so repeat captures of one fill become one.
+    const key = isSynthetic(r.order_id) ? 'S|' + natKey(r)
+      : (r.order_time ? dupKey(r) : 'R|' + String(r.order_id));
     const prev = seen.get(key);
     if (!prev) { seen.set(key, r); continue; }
     // keep the one with a usable broker figure
