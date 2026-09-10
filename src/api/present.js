@@ -43,6 +43,12 @@ function gateCell(g) {
     value: String(g.value ?? '—'),
     sub: g.sub ? String(g.sub) : '',
     rawNumber: typeof g.rawNumber === 'number' ? g.rawNumber : undefined,
+    // CR-7 · the server-formatted "value vs threshold — PASS/FAIL" the funnel
+    // built. The card prints check.text verbatim (C3) — the browser never
+    // re-derives a verdict it lacks the threshold to compute. null only for a
+    // gate that predates the funnel (none today); shape: { text, verdict, ok,
+    // warn, computed, actual, cmp, threshold }.
+    check: g.check || null,
   };
 }
 

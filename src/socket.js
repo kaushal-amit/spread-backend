@@ -45,6 +45,62 @@ function watchedSymbols() {
   return all;
 }
 
+/*
+ * ─── Phase 0 · SCANNER REENTRANCY GUARD + LIVENESS REGISTRY ──────────────────
+ *
+ * Every scanner below is a setInterval with an async body. If a tick's work
+ * outruns its interval — a slow board query, a stalled pool, the SPR-28
+ * backfill — the next tick fires while the previous is still in flight and they
+ * PILE UP: overlapping queries competing for the same 10-connection pool, a row
+ * cursor advanced from two ticks at once, the same halt emitted twice. The guard
+ * makes a tick SKIP rather than overlap, and the skip is LOUD — logged with a
+ * running count — never a silent stall.
+ *
+ * It also records each scanner's last SUCCESSFUL completion, so /health (Phase
+ * 0(f)) can show that a scanner is not merely alive but actually FINISHING its
+ * work: a loop wedged on a hung query looks identical to a healthy idle one
+ * until you can watch lastSuccessAt stop advancing. `scannerHealth()` exposes it.
+ */
+const _scannerHealth = {};
+function scanner(name, fn) {
+  const h = _scannerHealth[name] = { lastSuccessAt: null, lastError: null, runs: 0, skipped: 0, running: false };
+  return async (...args) => {
+    if (h.running) {
+      h.skipped += 1;
+      // Loud, but coalesced: the first overrun and then every 15th, so a
+      // persistent stall is unmistakable without flooding the log every tick.
+      if (h.skipped === 1 || h.skipped % 15 === 0) {
+        log.warn(`[${name}] previous scan still running — skipped ${h.skipped} tick(s); the loop is behind its interval`);
+      }
+      return;
+    }
+    if (h.skipped) { log.info(`[${name}] caught up after skipping ${h.skipped} tick(s)`); h.skipped = 0; }
+    h.running = true;
+    try {
+      await fn(...args);
+      h.lastSuccessAt = new Date().toISOString();
+      h.lastError = null;
+      h.runs += 1;
+    } catch (e) {
+      // The scanners already try/catch internally, so reaching here is unusual;
+      // record it anyway — a scanner that throws every tick must be visible.
+      h.lastError = e && e.message ? e.message : String(e);
+      log.warn(`[${name}] scan threw`, h.lastError);
+    } finally {
+      h.running = false;
+    }
+  };
+}
+/** Phase 0(f) · per-scanner liveness for /health: lastSuccessAt, runs, skips. */
+function scannerHealth() {
+  const out = {};
+  for (const [k, v] of Object.entries(_scannerHealth)) {
+    out[k] = { lastSuccessAt: v.lastSuccessAt, runs: v.runs, skipped: v.skipped,
+      running: v.running, lastError: v.lastError };
+  }
+  return out;
+}
+
 /** Is the market open right now? Every clock display must ask this first. */
 function sessionPhase(now = new Date()) {
   const k = new Date(now.getTime() + SESSION.timezoneOffsetHours * 3600000);
@@ -294,7 +350,7 @@ async function ruleAlerts(day, io) {
 }
 
 function startTicker(io, ms = TICK_MS) {
-  return setInterval(async () => {
+  return setInterval(scanner('tick', async () => {
     const day = daily.kuwaitDay();
     const r = room(day);
     if (!io.sockets.adapter.rooms.get(r)) return;
@@ -349,7 +405,7 @@ function startTicker(io, ms = TICK_MS) {
       // 19:55 because nothing asked the clock first.
       if (sessionPhase().open) await ruleAlerts(day, io);
     } catch (e) { log.warn('[tick]', e.message); }
-  }, ms);
+  }), ms);
 }
 
 /**
@@ -376,7 +432,7 @@ function startRowPoller(io, { everyMs = POLL_MS } = {}) {
   const seen = { minute: null, signal: null, position: null, market: null };
   let seeding = true;
 
-  return setInterval(async () => {
+  return setInterval(scanner('rowPoller', async () => {
     const day = daily.kuwaitDay();
     const r = room(day);
     if (!io.sockets.adapter.rooms.get(r)) return;
@@ -437,7 +493,7 @@ function startRowPoller(io, { everyMs = POLL_MS } = {}) {
     } catch (e) {
       log.warn('[poll]', e.message);
     }
-  }, everyMs);
+  }), everyMs);
 }
 
 /**
@@ -448,7 +504,7 @@ const WAKE_TIMES = ['09:30', '10:00', '10:30', '11:00', '11:30', '12:00'];
 
 function startWakeupScanner(io, { times = WAKE_TIMES, everyMs = 60000 } = {}) {
   const fired = new Set();
-  return setInterval(async () => {
+  return setInterval(scanner('wakeup', async () => {
     try {
       const k = new Date(Date.now() + 3 * 3600000);
       const hhmm = `${String(k.getUTCHours()).padStart(2, '0')}:${String(k.getUTCMinutes()).padStart(2, '0')}`;
@@ -463,7 +519,7 @@ function startWakeupScanner(io, { times = WAKE_TIMES, everyMs = 60000 } = {}) {
         lowConfidence: hhmm === '09:30' });
       log.info(`[wakeup] ${hhmm}: ${flagged.length} flagged`);
     } catch (e) { log.warn('[wakeup]', e.message); }
-  }, everyMs);
+  }), everyMs);
 }
 
 /**
@@ -485,7 +541,7 @@ function startAlertScanner(io, { everyMs = 60000 } = {}) {
    * the claim under test is 3.3-minute windows, several per session).
    */
   const open = new Map();
-  return setInterval(async () => {
+  return setInterval(scanner('alert', async () => {
     const phase = sessionPhase();
     if (!phase.open) {
       // The session closed with windows still open — close them at the bell so
@@ -547,7 +603,7 @@ function startAlertScanner(io, { everyMs = 60000 } = {}) {
         io.to(room(day)).emit('spread:entryAlertClosed', { alertId: o.alertId });
       }
     } catch (e) { log.warn('[alert]', e.message); }
-  }, everyMs);
+  }), everyMs);
 }
 
 /**
@@ -564,7 +620,7 @@ function startAlertScanner(io, { everyMs = 60000 } = {}) {
 function startHaltScanner(io, { everyMs = 20000 } = {}) {
   const sessions = new Map();
   let seeded = false;
-  return setInterval(async () => {
+  return setInterval(scanner('halt', async () => {
     const phase = sessionPhase();
     if (!phase.open) return;
     const day = daily.kuwaitDay();
@@ -637,7 +693,7 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
         io.to(roomId).emit('spread:slotStale', { slot: s.slot, symbol: s.symbol, lastCaptureAt: s.lastCaptureAt });
       }
     } catch (e) { log.warn('[halt]', e.message); }
-  }, everyMs);
+  }), everyMs);
 }
 
 /*
@@ -652,16 +708,16 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
  */
 function startFeedHealthScanner(io, { everyMs = 120000 } = {}) {
   const feedHealth = require('./services/feedHealth');
-  return setInterval(async () => {
+  return setInterval(scanner('feedHealth', async () => {
     if (!sessionPhase().open) return;
     const day = daily.kuwaitDay();
     try {
       const r = await feedHealth.check(day);
       if (r.available) io.to(room(day)).emit('spread:feedHealth', await feedHealth.roster());
     } catch (e) { log.warn('[feedHealth]', e.message); }
-  }, everyMs);
+  }), everyMs);
 }
 
 module.exports = { registerHandlers, startTicker, startWakeupScanner, startAlertScanner,
   ruleAlerts, sessionPhase, view, watchedSymbols, watchedBySocket, startRowPoller, announceStops,
-  startHaltScanner, startFeedHealthScanner };
+  startHaltScanner, startFeedHealthScanner, scannerHealth, scanner };

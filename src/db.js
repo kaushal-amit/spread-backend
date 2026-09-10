@@ -37,6 +37,13 @@ const pool = new Pool({
   idleTimeoutMillis: 30000,
   // A screening query that hangs blocks the tick loop. Fail instead.
   statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS || 20000),
+  // Phase 0 · bound the ACQUIRE, not just the query. statement_timeout only
+  // fires once a connection is in hand; when Postgres is unreachable or the
+  // pool is exhausted, pool.connect() (and every query behind it) hangs
+  // indefinitely, which stalls the whole tick loop with no error to see. Cap
+  // the wait so a dead database surfaces as a prompt, catchable failure —
+  // loud — rather than a silent hang the scanners pile up behind.
+  connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10000),
 });
 
 pool.on('error', (e) => console.error('[db] idle client error:', e.message));

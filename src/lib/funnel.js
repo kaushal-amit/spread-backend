@@ -154,6 +154,25 @@ function feasible(ticks, { gapPct, rangeFils } = {}, targets = null) {
 const pass = (id, label, ok, value, why, extra = {}) =>
   ({ id, label, ok: !!ok, value, why: ok ? null : why, ...extra });
 
+/*
+ * CR-7 · one server-formatted verdict per gate — the value, the comparator, the
+ * threshold, then PASS / FAIL / WARN. Built HERE, where the number and the
+ * threshold both live: the browser had neither the comparator nor the threshold
+ * and so rendered a red cell with no way to say why it was red. The pass/fail
+ * boolean is always the gate's own `ok` (one source of truth); this only formats
+ * it. `computed:false` renders "NOT COMPUTED" — a gate that failed for want of a
+ * number, which the board must show apart from a value that lost.
+ */
+function verdictText(actual, cmp, threshold, ok, { computed = true, warn = false } = {}) {
+  if (!computed) {
+    return { text: 'NOT COMPUTED', verdict: 'NOT_COMPUTED', ok: false, warn: false,
+      computed: false, actual: null, cmp, threshold: String(threshold) };
+  }
+  const verdict = warn ? 'WARN' : ok ? 'PASS' : 'FAIL';
+  return { text: `${actual} ${cmp} ${threshold} — ${verdict}`, verdict, ok: !!ok, warn: !!warn,
+    computed: true, actual: String(actual), cmp, threshold: String(threshold) };
+}
+
 /**
  * Run the funnel over one symbol-day.
  *
@@ -342,6 +361,33 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
       mode: direction.mode }));
 
   /*
+   * CR-7 · attach the formatted verdict to EVERY gate, from the same thresholds
+   * the gate compared against (keyed by id so the gate expressions above stay
+   * the single source of the pass/fail boolean). Gate 8 is the one BLOCKING gate
+   * and passes on an unknown baseline, so its unknown case reads "no baseline —
+   * PASS", never NOT COMPUTED; Gate 2 folds an infeasible target into its text.
+   */
+  const dist8known = known(volRatio) && known(flowRatio ?? blockRatio);
+  const CR7 = {
+    1:  { cmp: 'within', threshold: `${cfg.priceFloorFils}–${ceiling} fils`, computed: known(priceFils) },
+    2:  { cmp: '≥', threshold: `${cfg.netFloorKd} KD`, computed: known(econ.netKd),
+          override: !feas.ok ? { text: 'no feasible target at this budget — FAIL', verdict: 'FAIL' } : null },
+    3:  { cmp: '≥', threshold: `${cfg.minAvgTradeShares} sh`, computed: known(avgTrade) },
+    4:  { cmp: '≥', threshold: targetTicks >= 2 ? `${cfg.minPriceMoves2plus} of 2+/day` : `${cfg.minPriceMoves}/day`,
+          computed: targetTicks >= 2 ? known(moves2) : known(moves) },
+    5:  { cmp: '≤', threshold: `${cfg.maxPctMovesSub100}%`, computed: known(tinyPct) },
+    6:  { cmp: '≥', threshold: `${cfg.minPctPostable}%`, computed: known(postable) },
+    7:  { cmp: '≥', threshold: `${cfg.minPctExitableRatio}%`, computed: known(exitRatio) },
+    8:  { cmp: 'vs', threshold: `${cfg.distVolumeRatio}×/${cfg.distFlowRatio}× (both block)`, computed: dist8known,
+          override: !dist8known ? { text: 'no volume baseline — PASS', verdict: 'PASS' } : null },
+    9:  { cmp: '≥', threshold: `${cfg.minDaysActive5d} of ${cfg.consistencyWindow}`, computed: known(daysActive) },
+    10: { cmp: 'warn <', threshold: `${direction.warnChange1dFils}/${direction.warnChange5dFils} fils`,
+          computed: known(change1d) || known(change5d) },
+  };
+  // The application loop runs LAST (after the capture-quality and notComputed
+  // mutations below), so check.verdict always matches the gate's FINAL ok/warn.
+
+  /*
    * CAPTURE QUALITY. Gates 6 and 7 are percentages OF THE SESSION, and a
    * session only half captured produces a percentage of half a session. The
    * number is not wrong — it is NOT COMPARABLE, which is worse, because it
@@ -373,6 +419,31 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
   for (const g of gates) {
     g.notComputed = !g.ok && /not computed|not available/.test(g.why || '');
   }
+
+  /*
+   * CR-7 · apply the formatted verdict now that every gate's ok/warn/notComputed
+   * is FINAL (capture quality above can flip 6/7 to fail or warn). A gate that
+   * failed for want of a number reads "NOT COMPUTED"; a 6/7 failed by thin
+   * capture reads the capture reason, not a numeric line that individually
+   * passes; everything else is "<value> <cmp> <threshold> — PASS/FAIL/WARN".
+   */
+  for (const g of gates) {
+    const m = CR7[g.id];
+    if (!m) continue;
+    if (g.notComputed) { g.check = verdictText(g.value, m.cmp, m.threshold, false, { computed: false }); continue; }
+    if ((g.id === 6 || g.id === 7) && !g.ok && /computed from .*session/.test(g.why || '')) {
+      g.check = { text: `${g.value} — capture ${Math.round(capturePct)}%, not comparable (FAIL)`,
+        verdict: 'FAIL', ok: false, warn: false, computed: true, actual: g.value, cmp: m.cmp, threshold: m.threshold };
+      continue;
+    }
+    if (m.override) {
+      g.check = { text: m.override.text, verdict: m.override.verdict, ok: !!g.ok, warn: !!g.warn,
+        computed: true, actual: g.value, cmp: m.cmp, threshold: m.threshold };
+      continue;
+    }
+    g.check = verdictText(g.value, m.cmp, m.threshold, g.ok, { computed: m.computed, warn: g.warn });
+  }
+
   const failed = gates.filter((g) => !g.ok);
   const notComputed = failed.filter((g) => g.notComputed).map((g) => g.label.toLowerCase());
   const rising = known(num(row.close_fils)) && known(num(row.prev_close_fils))

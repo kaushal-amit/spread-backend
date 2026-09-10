@@ -20,10 +20,35 @@ const daily = require('./jobs/daily');
 const { toResponse } = require('./api/errors');
 
 const { registerHandlers, startTicker, startWakeupScanner, startAlertScanner,
-  startRowPoller, startHaltScanner, startFeedHealthScanner } = require('./socket');
+  startRowPoller, startHaltScanner, startFeedHealthScanner, scanner } = require('./socket');
+const { startDailyStatsScheduler } = require('./jobs/schedule');
 
 const PORT = Number(process.env.PORT || 4000);
 const app = express();
+
+/*
+ * Phase 0(d) · trust the reverse proxy, EXPLICITLY.
+ *
+ * auth.js decides "is this request local?" from req.ip and refuses a remote
+ * write when no token is set. Behind nginx every request arrives from the proxy,
+ * so without this Express reports the proxy's address as req.ip — a remote
+ * caller could read as loopback (the proxy sits on 127.0.0.1) and slip past the
+ * loopback-only rule, or a real client IP is lost from every log. Set via
+ * TRUST_PROXY so the operator states the topology rather than the code guessing:
+ * 'loopback' (nginx on the same host, the common case), a hop count, an IP list,
+ * or false. Default false — unchanged behaviour when unset, and in production
+ * assertProductionConfig already forces a token, so a misread cannot open a
+ * write there regardless.
+ */
+function parseTrustProxy(raw) {
+  if (raw == null || raw === '') return false;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  if (/^\d+$/.test(raw)) return Number(raw);      // a hop count
+  return raw;                                       // 'loopback' | 'uniquelocal' | an IP/subnet CSV
+}
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
+
 app.use(express.json());
 
 // The Vite dev server runs on :3000 and the API on :4000. In production the
@@ -90,7 +115,38 @@ process.on('unhandledRejection', (e) => {
   log.error('[process] unhandled rejection:', e && e.stack ? e.stack : e);
 });
 
+/*
+ * Phase 0(c) · an uncaught EXCEPTION is not the same as a rejection.
+ *
+ * A rejection above is logged and survived — a bad query string must not kill
+ * the terminal. An uncaughtException is different: after one, V8's own docs say
+ * the process is in an undefined state, and carrying on risks a half-mutated
+ * position or a corrupt in-memory session map — worse than a restart. So log it
+ * LOUDLY and exit non-zero, letting the supervisor (pm2, Phase 0(g), or
+ * systemd) restart clean. Loud + supervised restart beats limping on in an
+ * unknown state. The shutdown path is deliberately NOT reused here: it awaits
+ * the pool and sockets, and that state may be exactly what is corrupt.
+ */
+process.on('uncaughtException', (e) => {
+  log.error('[process] UNCAUGHT EXCEPTION — exiting for a clean restart:', e && e.stack ? e.stack : e);
+  process.exit(1);
+});
+
 const server = http.createServer(app);
+
+/*
+ * Phase 0(c) · a listen error must be fatal and NAMED, not swallowed.
+ *
+ * EADDRINUSE (a stale instance still holding :4000) and EACCES (a privileged
+ * port) fire here, off the callback path, so without this handler the process
+ * either crashes with a bare stack or — worse — appears to boot while never
+ * actually listening. Say which, then exit 1 so the supervisor retries rather
+ * than leaving a dead port that every health check silently fails.
+ */
+server.on('error', (e) => {
+  log.error(`[boot] server failed to listen on ${PORT}: ${e.code || ''} ${e.message}`);
+  process.exit(1);
+});
 const io = new Server(server, {
   cors: CORS_ORIGIN && CORS_ORIGIN !== '*' ? { origin: CORS_ORIGIN } : {},
 });
@@ -170,6 +226,12 @@ const timers = []; // interval handles, cleared on shutdown
     // SPR-27/30 · raise a data_alarm and push the roster when a capture feed
     // (orders above all) goes silent or absent — the six-session blind spot.
     timers.push(startFeedHealthScanner(io));
+    // SPR-28 · the 13:45 stats + fee-reconcile slot that never existed —
+    // spread.symbol_day_stats had 0 rows on every session because nothing ran
+    // the job. Guarded by the same reentrancy wrapper as the scanners (so a slow
+    // runDaily cannot overlap and /health sees its lastSuccessAt). Boot catch-up
+    // for today and the historical backfill run in the background inside start().
+    timers.push(startDailyStatsScheduler({ guard: scanner }));
   } catch (e) {
     log.error('[boot] failed:', e.message);
     process.exit(1);

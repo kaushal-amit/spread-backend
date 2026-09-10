@@ -196,6 +196,12 @@ function build() {
       // SPR-30 · which capture feeds are actually arriving, so the header need
       // never render a zero as data. Best-effort; a failure never fails health.
       body.feeds = await require('../services/feedHealth').roster().catch(() => ({ available: false, scripts: [] }));
+      // Phase 0(f) · per-scanner liveness. A scanner wedged on a hung query
+      // looks identical to a healthy idle one until lastSuccessAt stops
+      // advancing; exposing runs/skips/lastError here makes a stalled or
+      // overrunning loop — and the SPR-28 stats scheduler — visible to a probe
+      // without reading the process logs. Best-effort; never fails health.
+      try { body.scanners = require('../socket').scannerHealth(); } catch { body.scanners = null; }
       res.status(body.status === 'stale' ? 503 : 200).json(body);
     } catch (e) { res.status(503).json({ status: 'down', code: 'DB_DOWN', error: 'the database is not reachable' }); }
   });
