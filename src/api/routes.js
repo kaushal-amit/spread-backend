@@ -108,7 +108,7 @@ async function board(day, budgetKd) {
     // SPR-01 · the log that tells "wrong day asked" from "every symbol failed a
     // gate" apart: what was asked, what was screened, and how many came back.
     log.info(`[board] asked ${day} → screened ${screenDay} · ${value?.counts?.all ?? 0} symbols `
-      + `(${value?.counts?.recommended ?? 0} rec / ${value?.counts?.nearMiss ?? 0} near / ${value?.counts?.rejected ?? 0} rej)`);
+      + `(${value?.counts?.take ?? 0} take / ${value?.counts?.oneAway ?? 0} one-away / ${value?.counts?.priceWarn ?? 0} price-warn / ${value?.counts?.leave ?? 0} leave / ${value?.counts?.notComputed ?? 0} nc of ${value?.counts?.universe ?? '?'})`);
     boardCache.set(key, { at: Date.now(), value });
     // The cache never evicted: one entry per (day, budget, gate version) —
     // every ?budgetKd= what-if, every review date — each a full board (~0.5 MB),
@@ -122,9 +122,95 @@ async function board(day, budgetKd) {
   boardInflight.set(key, promise);
   try { return await promise; } finally { boardInflight.delete(key); }
 }
-const invalidate = () => { boardCache.clear(); };
+/**
+ * A write happened. Drop the board cache AND announce which sections of the
+ * snapshot it touched (lib/events) so the socket pushes a partial at once —
+ * the operator sees their own order the moment it is booked. No parts = all.
+ */
+const invalidate = (parts = [], reason = 'write') => {
+  boardCache.clear();
+  try { require('../lib/events').changed(parts, reason); } catch (e) { log.warn('[invalidate] announce failed', e.message); }
+};
 /** R-16 · the number of funnel runs since boot, for the concurrency test. */
 board.runs = () => boardRuns;
+
+/**
+ * ─── the snapshot readers ───────────────────────────────────────────────────
+ * The bodies of GET /session and GET /market, as functions, so the REST route
+ * and the socket snapshot (services/snapshot.js) build the SAME object. A
+ * field present over one path and absent over the other is a silent
+ * `undefined`, never an error — which is why there is one builder each.
+ */
+async function sessionView() {
+  const { sessionPhase } = require('../socket');
+  const p = sessionPhase();
+  const k = new Date(Date.now() + SESSION.timezoneOffsetHours * 3600000);
+
+  /*
+   * B-14 · drift was a hardcoded map {9: 0.203, 10: 0.296, ...}, and
+   * SessionBanner rendered the same four numbers again from its own copy.
+   *
+   * MEASURED: the market-wide average change from the open, by hour, over the
+   * captured sessions. Null when there is not enough history — an honest gap
+   * beats four constants that look like a finding.
+   */
+  const { rows } = await pool.query(
+    `WITH h AS (
+       SELECT spread.kuwait_day(created_at) AS d, symbol,
+              EXTRACT(hour FROM created_at ${K})::int AS hr,
+              last_price::numeric AS px,
+              first_value(last_price::numeric) OVER (
+                PARTITION BY spread.kuwait_day(created_at), symbol
+                ORDER BY created_at) AS open_px
+         FROM spread.v_quote_screening
+        WHERE spread.kuwait_day(created_at) >= current_date - 20
+     )
+     SELECT hr, round(avg(px - open_px)::numeric, 3) AS drift, count(DISTINCT d) AS sessions
+       FROM h WHERE open_px > 0 GROUP BY hr ORDER BY hr;`)/* a DB failure must not become an empty list — see errors.js */;
+
+  const row = rows.find((r2) => Number(r2.hr) === k.getUTCHours());
+  const mins = k.getUTCHours() * 60 + k.getUTCMinutes();
+  return {
+    ...present.sessionInfo({ ...p, hour: k.getUTCHours(),
+      timeStr: k.toISOString().slice(11, 16),
+      // C14 · computed, not 0/false — from lib/session (kb late_session_hhmm),
+      // not a 720 literal. "Late to open" is a position not posted by 09:30.
+      minutesToStepDown: p.open ? p.minutesToStepDown : 0,
+      lateToOpen: p.open && mins >= 570 },
+      row ? Number(row.drift) : 0),
+    open: !!p.open,
+    kuwaitDay: daily.kuwaitDay(),
+    // The reserve releases at kb reserve_release_hhmm (sizing.js reads the
+    // same row); the 660 literal here disagreed with it.
+    reserveReleased: mins >= require('../lib/session').hhmmToMins(
+      require('../config/thresholds').get('reserve_release_hhmm') ?? 1100),
+    clocks: p.clocks,
+    // The whole curve, so the banner stops carrying its own copy.
+    driftByHour: rows.map((r2) => ({
+      hour: Number(r2.hr), driftFils: Number(r2.drift), sessions: Number(r2.sessions) })),
+    driftMeasured: !!row,
+    // R-11 · the capture interval, from QUALITY — the browser reads stale from
+    // this (3 × the interval with no push), never a client-side constant.
+    captureIntervalSecs: QUALITY.captureIntervalSecs,
+    // R-19 / R-20 · the market gate and the session stops, as the server
+    // sees them now. canOpen false is what the trading routes enforce.
+    stops: await require('../services/stops').evaluate(daily.kuwaitDay()).catch((e) => ({ error: e.message, code: e.code, canOpen: false, mode: 'unknown', reasons: [`stops not computed: ${e.message}`] })),
+  };
+}
+
+async function marketView(d) {
+  // Today's row while the scraper is computing it intraday; else the latest.
+  const { rows: [m] } = await pool.query(
+    `SELECT * FROM spread.market_day WHERE trading_day <= $1
+      ORDER BY trading_day DESC LIMIT 1;`, [d]);
+  return { ...(present.marketDay(m) || {}), isToday: m ? String(m.trading_day).slice(0, 10) === d : false,
+    available: !!m };
+}
+
+async function accountView(d) {
+  const [a, pnl] = await Promise.all([accountSummary(d), pnlSummary(d)]);
+  return present.accountState(a, pnl);
+}
 
 /**
  * 6.4 · a keyset cursor, "<iso-timestamp>|<id>", from a previous page's `next`
@@ -210,7 +296,20 @@ function build() {
       // overrunning loop — and the SPR-28 stats scheduler — visible to a probe
       // without reading the process logs. Best-effort; never fails health.
       try { body.scanners = require('../socket').scannerHealth(); } catch { body.scanners = null; }
-      res.status(body.status === 'stale' ? 503 : 200).json(body);
+      /*
+       * The socket plan · a dead ticker is a 503 with its name. In session,
+       * the ticker must have DONE WORK (a heartbeat counts) within 2× its
+       * interval and the row poller within 2× its; a loop wedged on a hung
+       * query looks idle and healthy otherwise. Outside the session the
+       * ticker idles by design (after the final snapshot) and this is silent.
+       */
+      const dead = require('../socket').deadLoops({ now: t.t });
+      if (dead.length) {
+        body.status = 'dead';
+        body.dead = dead;
+        body.note = `${dead.map((x) => `${x.name} silent ${x.silentSec}s (limit ${x.limitSec}s)`).join('; ')} — the terminal is not being fed`;
+      }
+      res.status(body.status === 'stale' || body.status === 'dead' ? 503 : 200).json(body);
     } catch (e) { res.status(503).json({ status: 'down', code: 'DB_DOWN', error: 'the database is not reachable' }); }
   });
 
@@ -285,6 +384,14 @@ function build() {
       res.json((b[name] || []).map((x) => present.stockCandidate(x, budget(req))));
     } catch (e) { fail(res)(e); }
   };
+  // CR-8 · the four verdict buckets + NOT COMPUTED. The three old names stay
+  // for one release as aliases (recommended = take, near-miss = one-away,
+  // rejected = price-warn + leave).
+  r.get('/stocks/take', section('take'));
+  r.get('/stocks/one-away', section('oneAway'));
+  r.get('/stocks/price-warn', section('priceWarn'));
+  r.get('/stocks/leave', section('leave'));
+  r.get('/stocks/not-computed', section('notComputed'));
   r.get('/stocks/recommended', section('recommended'));
   r.get('/stocks/near-miss', section('nearMiss'));
   r.get('/stocks/rejected', section('rejected'));
@@ -294,7 +401,8 @@ function build() {
   r.get('/stocks', async (req, res) => {
     try {
       const b = await board(day(req), budget(req));
-      res.json([...b.recommended, ...b.nearMiss, ...b.rejected, ...(b.notComputed || [])]
+      // CR-8 · every instrument, in bucket order: nothing removed.
+      res.json([...b.take, ...b.oneAway, ...b.priceWarn, ...b.leave, ...(b.notComputed || [])]
         .map((x) => present.stockCandidate(x, budget(req))));
     } catch (e) { fail(res)(e); }
   });
@@ -303,7 +411,7 @@ function build() {
     try {
       const sym = symbolParam(req.params.symbol);
       const b = await board(day(req), budget(req));
-      const hit = [...b.recommended, ...b.nearMiss, ...b.rejected, ...(b.notComputed || [])]
+      const hit = [...b.take, ...b.oneAway, ...b.priceWarn, ...b.leave, ...(b.notComputed || [])]
         .find((x) => x.symbol.toUpperCase() === sym);
       res.json(hit ? present.stockCandidate(hit, budget(req)) : null);
     } catch (e) { fail(res)(e); }
@@ -314,7 +422,9 @@ function build() {
     const sym = symbolParam(req.params.symbol);
     {
       const b = await board(d, budget(req));
-      const hit = [...b.nearMiss, ...b.rejected].find((x) => x.symbol.toUpperCase() === sym);
+      // An override applies to a verdict the gates reached: ONE AWAY, PRICE
+      // WARN or LEAVE. TAKE needs none; NOT COMPUTED has nothing to override.
+      const hit = [...b.oneAway, ...b.priceWarn, ...b.leave].find((x) => x.symbol.toUpperCase() === sym);
       if (!hit) return res.status(404).json({ error: 'not on the board' });
 
       // A structural failure is ARITHMETIC, not judgement. There is no market
@@ -334,7 +444,7 @@ function build() {
         [d, hit.symbol, hit.passed ? 'TRADABLE' : 'NOT_RECOMMENDED',
          hit.failed, req.body?.note || null]);
 
-      invalidate();
+      invalidate(['board'], `override ${hit.symbol}`);
       const out = present.stockCandidate(hit, budget(req));
       res.json({ ...out, overrideLogged: true, overrideNote: req.body?.note });
     }
@@ -501,11 +611,7 @@ function build() {
 
   // ---- account and ledger · ILedgerService ------------------------------
   r.get('/account', async (req, res) => {
-    const d = day(req);
-    try {
-      const [a, pnl] = await Promise.all([accountSummary(d), pnlSummary(d)]);
-      res.json(present.accountState(a, pnl));
-    } catch (e) { fail(res)(e); }
+    try { res.json(await accountView(day(req))); } catch (e) { fail(res)(e); }
   });
 
   // R-15 (decided) · from/to filter on trading_day; the rows sort on (at, id).
@@ -679,7 +785,7 @@ function build() {
     }
     await gateStore.save(cfgChanges, { changedBy: changedBy || 'ui', note: note || null,
       passesBefore: before?.recommended.length ?? null });
-    invalidate();
+    invalidate(['board', 'budget', 'session'], 'gates');
     const after = await board(daily.kuwaitDay(), gateStore.sessionBudgetKd()).catch(() => null);
     return present.gateConfigs(gateStore.effective(), {
       version: gateStore.meta().version, loadedAt: gateStore.meta().loadedAt,
@@ -714,62 +820,7 @@ function build() {
   }));
 
   // ---- session · ISessionService ---------------------------------------
-  r.get('/session', wrap(async (req, res) => {
-    const { sessionPhase } = require('../socket');
-    const p = sessionPhase();
-    const k = new Date(Date.now() + SESSION.timezoneOffsetHours * 3600000);
-
-    /*
-     * B-14 · drift was a hardcoded map {9: 0.203, 10: 0.296, ...}, and
-     * SessionBanner rendered the same four numbers again from its own copy.
-     *
-     * MEASURED: the market-wide average change from the open, by hour, over the
-     * captured sessions. Null when there is not enough history — an honest gap
-     * beats four constants that look like a finding.
-     */
-    const { rows } = await pool.query(
-      `WITH h AS (
-         SELECT spread.kuwait_day(created_at) AS d, symbol,
-                EXTRACT(hour FROM created_at ${K})::int AS hr,
-                last_price::numeric AS px,
-                first_value(last_price::numeric) OVER (
-                  PARTITION BY spread.kuwait_day(created_at), symbol
-                  ORDER BY created_at) AS open_px
-           FROM spread.v_quote_screening
-          WHERE spread.kuwait_day(created_at) >= current_date - 20
-       )
-       SELECT hr, round(avg(px - open_px)::numeric, 3) AS drift, count(DISTINCT d) AS sessions
-         FROM h WHERE open_px > 0 GROUP BY hr ORDER BY hr;`)/* a DB failure must not become an empty list — see errors.js */;
-
-    const row = rows.find((r2) => Number(r2.hr) === k.getUTCHours());
-    const mins = k.getUTCHours() * 60 + k.getUTCMinutes();
-    res.json({
-      ...present.sessionInfo({ ...p, hour: k.getUTCHours(),
-        timeStr: k.toISOString().slice(11, 16),
-        // C14 · computed, not 0/false — from lib/session (kb late_session_hhmm),
-        // not a 720 literal. "Late to open" is a position not posted by 09:30.
-        minutesToStepDown: p.open ? p.minutesToStepDown : 0,
-        lateToOpen: p.open && mins >= 570 },
-        row ? Number(row.drift) : 0),
-      open: !!p.open,
-      kuwaitDay: daily.kuwaitDay(),
-      // The reserve releases at kb reserve_release_hhmm (sizing.js reads the
-      // same row); the 660 literal here disagreed with it.
-      reserveReleased: mins >= require('../lib/session').hhmmToMins(
-        require('../config/thresholds').get('reserve_release_hhmm') ?? 1100),
-      clocks: p.clocks,
-      // The whole curve, so the banner stops carrying its own copy.
-      driftByHour: rows.map((r2) => ({
-        hour: Number(r2.hr), driftFils: Number(r2.drift), sessions: Number(r2.sessions) })),
-      driftMeasured: !!row,
-      // R-11 · the capture interval, from QUALITY — the browser reads stale from
-      // this (3 × the interval with no push), never a client-side constant.
-      captureIntervalSecs: QUALITY.captureIntervalSecs,
-      // R-19 / R-20 · the market gate and the session stops, as the server
-      // sees them now. canOpen false is what the trading routes enforce.
-      stops: await require('../services/stops').evaluate(daily.kuwaitDay()).catch((e) => ({ error: e.message, code: e.code, canOpen: false, mode: 'unknown', reasons: [`stops not computed: ${e.message}`] })),
-    });
-  }));
+  r.get('/session', wrap(async (_req, res) => res.json(await sessionView())));
 
   // The gate and the stops on their own, for a page that needs only them.
   r.get('/session/stops', wrap(async (_req, res) => {
@@ -777,17 +828,8 @@ function build() {
   }));
 
   // ---- market · the breadth strip ---------------------------------------
-  r.get('/market', wrap(async (req, res) => {
-    const d = day(req);
-    // Today's row while the scraper is computing it intraday; else the latest.
-    const { rows: [m] } = await pool.query(
-      `SELECT * FROM spread.market_day WHERE trading_day <= $1
-        ORDER BY trading_day DESC LIMIT 1;`, [d]);
-    res.json({ ...(present.marketDay(m) || {}), isToday: m ? String(m.trading_day).slice(0, 10) === d : false,
-      available: !!m });
-  }));
+  r.get('/market', wrap(async (req, res) => res.json(await marketView(day(req)))));
 
-  // ---- AI · IAiService --------------------------------------------------
   r.get('/ai/history', async (req, res) => {
     try {
       const { rows } = await pool.query(
@@ -954,7 +996,21 @@ function build() {
     log.info(`[slots] ${req.auth?.kind || '?'}${req.auth?.uid ? ':' + req.auth.uid : ''} → slot ${n} = ${symbol} (${reason})`);
     const out = await sc.applySlot(n, { symbol, reason, replacedSymbol });
     if (out.networkError) throw notReady('the scraper is not reachable for a slot swap', out.reason);
+    if (out.ok) require('../lib/events').changed(['slots'], `slot ${n} → ${symbol}`);
     res.status(out.status || (out.ok ? 200 : 502)).json(out.body ?? { ok: out.ok });
+  }));
+
+  /*
+   * ─── GET /api/bootstrap · the snapshot, once, for the first paint ───────────
+   * The SAME object the socket pushes every minute (services/snapshot.js). The
+   * SPA calls it on mount and when the heartbeat's seq runs ahead of the last
+   * snapshot it received; nothing else on the terminal polls.
+   */
+  r.get('/bootstrap', wrap(async (req, res) => {
+    const d = day(req);
+    let b = null;
+    try { b = budget(req); } catch { b = null; }          // no budget: the board section says NOT_READY
+    res.json(await require('../services/snapshot').snapshot(d, b, { reason: 'bootstrap' }));
   }));
 
   r.get('/candles/:symbol', wrap(async (req, res) => {
@@ -971,4 +1027,4 @@ function build() {
   return r;
 }
 
-module.exports = { build, board, invalidate, contracts, accountSummary, pnlSummary, resolveScreenDay };
+module.exports = { build, board, invalidate, contracts, accountSummary, pnlSummary, resolveScreenDay, sessionView, marketView, accountView };

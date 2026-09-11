@@ -56,11 +56,96 @@ function liveDirection({ openFils, lastFils, highFils }, now = new Date(), openH
         : 'has not traded above the open — no upward direction' };
 }
 
+/**
+ * CR-8 · place EVERY evaluated row in exactly one bucket, and assert that
+ * nothing went missing. Exported so the assertion can be tested on its own.
+ */
+function bucketize(results, { tradingDay, budgetKd, cfg = GATES } = {}) {
+  const realFailed = (r) => r.failed.filter((f) => !(r.notComputed || []).includes(f));
+  const isPureNotComputed = (r) => !r.passed && r.failed.length > 0 && realFailed(r).length === 0;
+  /*
+   * PRICE WARN · "the price ceiling is the only failure" — read as the only
+   * FACT that fails. Above the ceiling Gate 2 (profit floor) fails too, for
+   * the same reason: at this price the target does not net the floor at this
+   * budget. One fact, two gates; a stock that fails ONLY those two is a
+   * price-warn, not a two-gate LEAVE. Anything else failing (or NOT COMPUTED)
+   * and the row takes the ordinary path.
+   */
+  const ECON = new Set(['price band', 'profit floor']);
+  const priceCeilingOnly = (r) => {
+    if (r.structural || !r.failed.length || !r.failed.includes('price band')) return false;
+    if (!r.failed.every((f) => ECON.has(f))) return false;
+    const g = (r.gates || []).find((x) => x.id === 1);
+    return !!g && !g.notComputed && r.priceFils != null && Number(r.priceFils) > Number(g.ceiling ?? r.ceiling);
+  };
+  // "needs N fils": the smallest tick move at which this price nets the floor
+  // at this budget (CR-2's break-even by budget). null when nothing under 12
+  // fils does — the row then says so rather than printing a number.
+  const needsFils = (r) => {
+    const price = r.orderPriceFils ?? r.priceFils;
+    if (price == null || !budgetKd) return null;
+    for (let t = 1; t <= 12; t++) {
+      const n = funnel.netAtTicks(budgetKd, Number(price), t, { day: tradingDay, premier: /premier/i.test(String(r.market || '')) });
+      if (n.netKd != null && n.netKd >= cfg.netFloorKd) return t;
+    }
+    return null;
+  };
+
+  for (const r of results) {
+    r.suspended = r.isTradeable === false;
+    if (!r.reachable) { r.structural = true; r.structuralReason = 'OUT_OF_REACH'; }
+    else if (r.suspended) { r.structural = true; r.structuralReason = 'SUSPENDED'; }
+    else if (r.structural) {
+      r.structuralReason = (r.gates || []).some((g) => g.id === 1 && g.structural) ? 'BELOW_TICK' : 'INFEASIBLE_TARGET';
+    } else r.structuralReason = null;
+
+    if (r.structural) r.bucket = 'LEAVE';
+    else if (isPureNotComputed(r)) r.bucket = 'NOT_COMPUTED';
+    else if (r.passed) r.bucket = 'TAKE';
+    else if (priceCeilingOnly(r)) r.bucket = 'PRICE_WARN';
+    else if (r.failed.length === 1) r.bucket = 'ONE_AWAY';
+    else r.bucket = 'LEAVE';
+    r.needsFils = r.bucket === 'PRICE_WARN' ? needsFils(r) : null;
+    // The ABAR line: no symbol_day row for this day, and when the last one was.
+    r.noRow = r.no_row === true;
+    r.lastRowDay = r.last_row_day || null;
+    r.noRowReason = r.noRow
+      ? `no symbol_day row for ${tradingDay}` + (r.lastRowDay ? ` — last row ${r.lastRowDay}` : ' — never computed')
+      : null;
+  }
+
+  const byBucket = (b) => results.filter((r) => r.bucket === b);
+  const take = funnel.rank(byBucket('TAKE'));
+  const oneAway = funnel.rank(byBucket('ONE_AWAY'));
+  const priceWarn = funnel.rank(byBucket('PRICE_WARN'));
+  const notComputed = byBucket('NOT_COMPUTED');
+  // LEAVE: by what they WOULD have paid, descending — a well-paying rejection
+  // belongs where it gets read. Structural rows last (the fold), still present.
+  const byNet = (a, b) => (b.netAtTarget?.netKd ?? -Infinity) - (a.netAtTarget?.netKd ?? -Infinity);
+  const leave = [...byBucket('LEAVE').filter((r) => !r.structural).sort(byNet),
+    ...byBucket('LEAVE').filter((r) => r.structural).sort(byNet)];
+
+  const universe = results.length;
+  const placed = take.length + oneAway.length + priceWarn.length + leave.length + notComputed.length;
+  if (placed !== universe) {
+    const e = new Error(`UNIVERSE_MISMATCH: ${universe} instruments screened, ${placed} placed in buckets — a symbol was removed`);
+    e.code = 'UNIVERSE_MISMATCH';
+    throw e;
+  }
+
+  return { take, oneAway, priceWarn, leave, notComputed, realFailed };
+}
+
 async function screen(tradingDay, budgetKd = BUDGET.slotKd,
                       { db = pool, cfg = GATES, targets = null,
                         direction = null, quality = null, now = new Date() } = {}) {
   const { rows } = await db.query(
     `SELECT d.*,
+            s.symbol AS symbol,                       -- d.symbol is NULL when there is no row
+            d.symbol IS NULL          AS no_row,
+            lr.last_row_day::text     AS last_row_day,
+            COALESCE(d.capture_quality, 'MISSING') AS capture_quality_effective,
+            s.is_primary,
             -- gap_pct, pct_session_postable_800 and the rest of the funnel's
             -- columns come from the VIEW (016): the scraper's value first,
             -- the backend bridge second. C-02: this line was NULL::numeric AS
@@ -76,21 +161,32 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
             q.bid AS live_bid, q.bid_qty AS live_bid_shares,
             q.offer AS live_offer, q.offer_qty AS live_offer_shares,
             q.created_at AS quote_at
-       FROM spread.symbol_day d
-       /**
-        * ─── public.instruments, NOT spread.symbol ─────────────────────────
+       FROM public.instruments s
+       /*
+        * ─── CR-8 · THE UNIVERSE IS public.instruments, NOT symbol_day ─────────
         *
-        * spread.symbol had ZERO ROWS for its whole life, and this is an INNER
-        * join — so this query returned an empty board on every session, with
-        * no error, for months. Dropping the table as an unused duplicate is
-        * what finally made it fail loudly.
+        * This was FROM spread.symbol_day JOIN instruments, filtered on
+        * capture_quality. Every symbol WITHOUT a row for the day — not captured
+        * (ABAR left the scrape on 26 July and nobody noticed for a month),
+        * halted all day, newly listed, or simply not yet computed — was absent
+        * from the board, and a board without ABAR looks exactly like a board
+        * where ABAR failed. A gate that hides a candidate is indistinguishable
+        * from a gate that had no candidates to hide.
         *
-        * The canonical list is public.instruments: 142 rows, is_primary,
-        * is_tradeable, broker_status. Reading public.* is allowed; the lint
-        * rule forbids WRITING to it.
+        * Now every primary instrument is a row on every day's board. A missing
+        * symbol_day row is NOT COMPUTED with the last row named; a MISSING
+        * capture grade is a mark on the row, never a WHERE. The row count is
+        * asserted below (UNIVERSE_MISMATCH) — nothing between here and the
+        * buckets may reduce it.
+        *
+        * spread.symbol had ZERO ROWS for its whole life and an INNER join on it
+        * returned an empty board for months, silently. public.instruments is
+        * the canonical list: 142 rows, is_primary, is_tradeable, broker_status.
+        * Reading public.* is allowed; the lint rule forbids WRITING to it.
         */
-       JOIN public.instruments s USING (symbol)
-       LEFT JOIN spread.symbol_profile p USING (symbol)
+       LEFT JOIN spread.symbol_day d
+         ON d.symbol = s.symbol AND d.trading_day = $1
+       LEFT JOIN spread.symbol_profile p ON p.symbol = s.symbol
        LEFT JOIN LATERAL (
          SELECT bid::numeric, bid_qty::bigint, offer::numeric, offer_qty::bigint, created_at,
                 -- R-25 · today's open / last / high from the latest capture, for the
@@ -98,24 +194,15 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
                 -- yesterday-based DIRECTION warn-gate.
                 open_price::numeric AS today_open, last_price::numeric AS today_last, high_price::numeric AS today_high
            FROM spread.v_quote_screening v
-          WHERE v.symbol = d.symbol
+          WHERE v.symbol = s.symbol
           ORDER BY created_at DESC LIMIT 1) q ON true
-      -- PARTIAL rows are INCLUDED and marked. Excluding them silently is how a
-      -- stock disappears for a scraper reason rather than a trading one.
-      /**
-       * ─── FULL, PARTIAL, THIN — the values the column actually holds ──────
-       *
-       * This read IN ('OK','PARTIAL'). symbol_day stores FULL and THIN; 'OK'
-       * is not a value this system produces, so the filter matched nothing —
-       * a second, independent reason the board never returned a row.
-       *
-       * THIN is INCLUDED and marked. Excluding it silently is how a stock
-       * disappears for a scraper reason rather than a trading one, and 14 of
-       * 29 captured days are THIN.
-       */
-      WHERE d.trading_day = $1
-        AND (d.capture_quality IS NULL
-             OR d.capture_quality IN ('FULL','PARTIAL','THIN'));`,
+       -- The last symbol_day row on or before the screen day, for the NOT
+       -- COMPUTED reason when today's is missing ("last row 2026-07-25").
+       LEFT JOIN LATERAL (
+         SELECT max(x.trading_day) AS last_row_day
+           FROM spread.symbol_day x
+          WHERE x.symbol = s.symbol AND x.trading_day <= $1) lr ON true
+      WHERE s.is_primary;`,
     [tradingDay]);
 
   const results = rows.map((r) => {
@@ -124,6 +211,9 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
 
     const evaluated = funnel.evaluate({
       ...r,
+      // CR-8 · no row for the day is a MISSING capture grade on the row, not an
+      // absent row: the funnel then reads every gate NOT COMPUTED.
+      capture_quality: r.capture_quality_effective,
       // Gate 1 judges the STOCK — the tick regime is a property of the security
       // and does not change because the bid ticked down.
       priceFils: closeFils ?? bidFils,
@@ -150,6 +240,8 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
     return {
       ...evaluated,
       market: r.market, marketVerified: r.market_verified, nameAr: r.name_ar,
+      isTradeable: r.is_tradeable, brokerStatus: r.broker_status, no_row: r.no_row, last_row_day: r.last_row_day,
+      orderPriceFils: bidFils ?? closeFils,
       bidFils, offerFils: r.live_offer == null ? null : Number(r.live_offer),
       spreadFils: bidFils != null && r.live_offer != null
         ? Number(r.live_offer) - bidFils : null,
@@ -198,30 +290,46 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
   }
 
   /*
-   * SPR-38 · THREE BUCKETS, NOT TWO. A gate that could not be computed (its
-   * statistic is missing) is not a failed stock — so a card that fails ONLY on
-   * NOT COMPUTED gates belongs in its own bucket, never in `rejected`. Filing
-   * all 140 under "140 rejected" beside a card reading NOT COMPUTED is what made
-   * the whole board untrustworthy.
+   * ─── CR-8 · FOUR VERDICT BUCKETS + NOT COMPUTED. NOTHING REMOVED. ─────────
    *
-   * A real failure is a failed gate that is NOT in the notComputed set.
+   * SPR-38 gave NOT COMPUTED its own bucket (a gate without a number is not a
+   * failed stock). CR-8 finishes the rule: EVERY row lands in exactly one of
+   *
+   *   TAKE         every gate passes, and every gate was computed
+   *   ONE AWAY     exactly one gate fails — overridable, and not the ceiling
+   *   PRICE WARN   the ONLY failure is the price ceiling for this budget: an
+   *                economics warning ("needs 3 fils at 2,000 KD"), not a stock
+   *                verdict. Today it hid inside nearMiss/rejected unmarked.
+   *   LEAVE        two or more failures — and the STRUCTURAL rows, which used
+   *                to vanish: out of reach at this budget (a JS filter dropped
+   *                them before the buckets — the quiet one), below the 100-fil
+   *                tick, an infeasible target, a suspended instrument. They
+   *                stay on the board with `structural: true` and a reason, so
+   *                the SPA can FOLD them at the foot of LEAVE — folded, never
+   *                filtered. Non-overridable, as before.
+   *   NOT COMPUTED a row whose only failures are missing numbers — including
+   *                "no symbol_day row for this day" (the ABAR case).
+   *
+   * Out of reach / suspended are MEASURED facts about the row and outrank a
+   * verdict the gates could not reach: an unreachable symbol with missing
+   * stats is LEAVE (OUT_OF_REACH), not NOT COMPUTED. Both read on the card.
+   *
+   * The universe assertion below is what makes "nothing removed" a property
+   * rather than a promise: the buckets must sum to the instruments count or
+   * the board is an ERROR, never a shorter board.
    */
-  const realFailed = (r) => r.failed.filter((f) => !(r.notComputed || []).includes(f));
-  const isPureNotComputed = (r) => !r.passed && r.failed.length > 0 && realFailed(r).length === 0;
-
+  const { take, oneAway, priceWarn, leave, notComputed, realFailed } = bucketize(results, { tradingDay, budgetKd, cfg });
+  const universe = results.length;
   const reachable = results.filter((r) => r.reachable);
-  const recommended = funnel.rank(reachable.filter((r) => r.passed));
-  const notComputed = reachable.filter(isPureNotComputed);
-  const decided = reachable.filter((r) => !r.passed && !isPureNotComputed(r)); // has a real failure
-  const nearMiss = funnel.rank(decided.filter((r) => r.failed.length === 1));
-  // By what they WOULD have paid, descending. A well-paying rejection belongs
-  // where it gets read.
-  const rejected = decided
-    .filter((r) => r.failed.length > 1)
-    .sort((a, b) => (b.netAtTarget.netKd ?? -Infinity) - (a.netAtTarget.netKd ?? -Infinity));
-
-  const counts = { all: results.length, recommended: recommended.length,
-    nearMiss: nearMiss.length, rejected: rejected.length, notComputed: notComputed.length };
+  const counts = { all: universe, universe,
+    take: take.length, oneAway: oneAway.length, priceWarn: priceWarn.length, leave: leave.length,
+    notComputed: notComputed.length,
+    outOfReach: results.filter((r) => r.structuralReason === 'OUT_OF_REACH').length,
+    belowTick: results.filter((r) => r.structuralReason === 'BELOW_TICK').length,
+    suspended: results.filter((r) => r.structuralReason === 'SUSPENDED').length,
+    noRow: results.filter((r) => r.noRow).length,
+    // The old names, for one release (the AI screen tool and the SPA read them).
+    recommended: take.length, nearMiss: oneAway.length, rejected: priceWarn.length + leave.length };
   // Failures by gate counts REAL failures only — a NOT COMPUTED gate is a
   // missing number, not a failed stock, and must not swell the tally.
   for (const r of results) for (const f of realFailed(r)) counts[f] = (counts[f] || 0) + 1;
@@ -233,12 +341,16 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
   counts.noStats = results.filter((r) => r.quoteAt != null && !r.gateStatsSource).length;
 
   return {
-    tradingDay, budgetKd, recommended, nearMiss, rejected, notComputed, counts,
+    tradingDay, budgetKd,
+    take, oneAway, priceWarn, leave, notComputed, counts,
+    // Deprecated aliases (one release): recommended = take, nearMiss = oneAway,
+    // rejected = priceWarn + leave. New readers use the bucket names.
+    recommended: take, nearMiss: oneAway, rejected: [...priceWarn, ...leave],
     reach: {
-      reachable: reachable.length, total: results.length,
+      reachable: reachable.length, total: universe,
       at2500: results.filter((r) => r.minBudgetKd == null || r.minBudgetKd <= 2500).length,
       // Saying this is more useful than showing an empty board.
-      note: `at ${budgetKd} KD, ${reachable.length} of ${results.length} are reachable`,
+      note: `at ${budgetKd} KD, ${reachable.length} of ${universe} are reachable`,
     },
     bands: funnel.tickBands(budgetKd, cfg, targets),
   };
@@ -297,4 +409,4 @@ function behaviourFlags(row, ev, cfg = GATES) {
   return f.sort((a, b) => a.priority - b.priority);
 }
 
-module.exports = { screen, behaviourFlags, liveDirection };
+module.exports = { screen, bucketize, behaviourFlags, liveDirection };

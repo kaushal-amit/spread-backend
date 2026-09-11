@@ -240,6 +240,39 @@ const symbol = String(symbolIn || '').toUpperCase();
   });
 }
 
+/**
+ * The /budget body — ONE builder for the REST route and the socket snapshot
+ * (services/snapshot.js), so the two cannot drift.
+ *
+ * free is what a NEW position may use. Every size on screen comes from here
+ * or from /sizing — never from the budget directly.
+ */
+async function budgetView() {
+  const t = await thresholds();
+  const budget = await budgetKd();
+  const c = await committedKd(today());
+
+  // Held back until reserve_release_hhmm, then available.
+  const k = new Date(Date.now() + 3 * 3600_000);
+  const nowHHMM = k.getUTCHours() * 100 + k.getUTCMinutes();
+  const reserveHeld = nowHHMM < t.reserve_release_hhmm;
+  const reserve = reserveHeld ? Number((budget * t.reserve_pct / 100).toFixed(3)) : 0;
+
+  return {
+    budget_kd: budget,
+    reserve_kd: reserve,
+    reserve_held: reserveHeld,
+    reserve_releases_at_hhmm: t.reserve_release_hhmm,
+    committed_kd: Number(c.kd.toFixed(3)),
+    open_positions: c.positions,
+    free_kd: Number(Math.max(0, budget - reserve - c.kd).toFixed(3)),
+    min_position_kd: t.min_position_kd,
+    max_price_fils: t.max_price_fils,
+    note: 'free_kd is what a NEW position may use. Sizing NEVER divides the '
+      + 'total: with one position open that is wrong on every other symbol.',
+  };
+}
+
 function build() {
   const r = express.Router();
 
@@ -249,31 +282,7 @@ function build() {
    * free is what a NEW position may use. Every size on screen comes from here
    * or from /sizing — never from the budget directly.
    */
-  r.get('/budget', wrap(async (_req, res) => {
-    const t = await thresholds();
-    const budget = await budgetKd();
-    const c = await committedKd(today());
-
-    // Held back until reserve_release_hhmm, then available.
-    const k = new Date(Date.now() + 3 * 3600_000);
-    const nowHHMM = k.getUTCHours() * 100 + k.getUTCMinutes();
-    const reserveHeld = nowHHMM < t.reserve_release_hhmm;
-    const reserve = reserveHeld ? Number((budget * t.reserve_pct / 100).toFixed(3)) : 0;
-
-    res.json({
-      budget_kd: budget,
-      reserve_kd: reserve,
-      reserve_held: reserveHeld,
-      reserve_releases_at_hhmm: t.reserve_release_hhmm,
-      committed_kd: Number(c.kd.toFixed(3)),
-      open_positions: c.positions,
-      free_kd: Number(Math.max(0, budget - reserve - c.kd).toFixed(3)),
-      min_position_kd: t.min_position_kd,
-      max_price_fils: t.max_price_fils,
-      note: 'free_kd is what a NEW position may use. Sizing NEVER divides the '
-        + 'total: with one position open that is wrong on every other symbol.',
-    });
-  }));
+  r.get('/budget', wrap(async (_req, res) => res.json(await budgetView())));
 
   /**
    * GET /sizing/:symbol
@@ -289,4 +298,4 @@ function build() {
   return r;
 }
 
-module.exports = { build, sizingFor, thresholds, budgetKd };
+module.exports = { build, sizingFor, thresholds, budgetKd, budgetView };

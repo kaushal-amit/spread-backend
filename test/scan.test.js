@@ -39,6 +39,30 @@ const path = require('path');
     }
   }
 
+  /*
+   * CR-8 · NOTHING REMOVED FROM THE BOARD — the guard that keeps the three
+   * removal paths from coming back:
+   *   R1  a join FROM symbol_day (a symbol with no row was absent)
+   *   R2  a WHERE on capture_quality (MISSING rows were dropped)
+   *   R3  a .filter( on `results` before the buckets (out-of-reach rows vanished)
+   * plus HAVING anywhere in the screen or the presenter — a floor on a
+   * STATISTIC belongs in the stats job; a floor on a SYMBOL is the bug.
+   */
+  {
+    const src = fs.readFileSync(path.join(__dirname, '../src/services/screening.js'), 'utf8');
+    const pres = fs.readFileSync(path.join(__dirname, '../src/api/present.js'), 'utf8');
+    const strip = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*(--|\/\/).*$/gm, '');
+    const code = strip(src), pcode = strip(pres);
+    const f = (cond, msg) => { if (!cond) { bad += 1; console.log('  FAIL CR-8 guard: ' + msg); } };
+    f(!/\bHAVING\b/i.test(code) && !/\bHAVING\b/i.test(pcode), 'HAVING in screening.js/present.js — a symbol-level floor removes a row');
+    f(!/WHERE[^;]*capture_quality/i.test(code), 'WHERE … capture_quality in the screen query — a capture grade is a mark on the row, never a filter');
+    f(/FROM\s+public\.instruments\s+s\b/.test(code) && /LEFT JOIN spread\.symbol_day d\b/.test(code), 'the screen must select FROM public.instruments LEFT JOIN spread.symbol_day — the universe is the instrument list');
+    const a = code.indexOf('const results = rows.map('), b = code.lastIndexOf('bucketize(results, {');
+    f(a > 0 && b > a, 'screening.js must hand `results` to bucketize()');
+    f(!/\bresults\s*\.\s*filter\s*\(/.test(code.slice(a, b)), 'a results.filter( before the buckets — that is how out-of-reach rows vanished (R3)');
+    f(/UNIVERSE_MISMATCH/.test(code), 'the universe assertion (UNIVERSE_MISMATCH) must stay');
+  }
+
   console.log(bad ? `\nFAILURES: ${bad}` : '\nALL PASS  (source scan)');
   if (query) { const { pool } = require('../src/db'); await pool.end(); }
   process.exit(bad ? 1 : 0);

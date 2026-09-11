@@ -124,11 +124,15 @@ function stockCandidate(r, budgetKd) {
   // status — never counted as rejected. A real failure is a failed gate not in
   // the notComputed set.
   const realFailedCount = (r.failed || []).filter((f) => !(r.notComputed || []).includes(f)).length;
-  // Same ordering for the section: a structural failure is never a near miss.
-  const status = r.passed ? 'recommended'
-    : (!r.passed && r.failed.length > 0 && realFailedCount === 0) ? 'not_computed'
-    : (!r.structural && r.failed.length === 1) ? 'near_miss'
-    : 'rejected';
+  // CR-8 · the bucket is decided ONCE, in screening.js, and the status is its
+  // old-name shadow (one release). A row built without a bucket (a fixture, a
+  // single-row evaluate) falls back to the pre-CR-8 rule.
+  const bucket = r.bucket || (r.structural ? 'LEAVE'
+    : r.passed ? 'TAKE'
+    : (!r.passed && r.failed.length > 0 && realFailedCount === 0) ? 'NOT_COMPUTED'
+    : r.failed.length === 1 ? 'ONE_AWAY'
+    : 'LEAVE');
+  const status = { TAKE: 'recommended', ONE_AWAY: 'near_miss', PRICE_WARN: 'price_warn', LEAVE: 'rejected', NOT_COMPUTED: 'not_computed' }[bucket];
 
   /*
    * STRUCTURAL IS CHECKED BEFORE COUNTING FAILURES.
@@ -183,9 +187,22 @@ function stockCandidate(r, budgetKd) {
     rising: r.rising ?? null,
     status,
     verdict,
+    // CR-8 · the four verdict buckets + NOT COMPUTED; nothing is removed.
+    bucket,
+    // "needs N fils at this budget" — PRICE WARN only; null when no move under
+    // 12 fils nets the floor (the card says so instead of a number).
+    needsFils: bucket === 'PRICE_WARN' ? (r.needsFils ?? null) : undefined,
+    // Why a structural row is folded: OUT_OF_REACH | BELOW_TICK | INFEASIBLE_TARGET | SUSPENDED
+    structuralReason: r.structuralReason || null,
+    // The ABAR line: no symbol_day row for the screen day, and the last one.
+    noRow: !!r.noRow,
+    lastRowDay: r.lastRowDay ?? null,
     failingGatesCount: r.failed.length,
     failingGateNames: r.failed,
-    rejectionDetail: r.reasons?.[0] || undefined,
+    rejectionDetail: r.structuralReason === 'OUT_OF_REACH'
+      ? `out of reach at ${budgetKd} KD — needs ${r.minBudgetKd} KD`
+      : r.structuralReason === 'SUSPENDED' ? `suspended — broker status ${r.brokerStatus || 'not tradeable'}`
+        : r.noRowReason || r.reasons?.[0] || undefined,
     gateGroups: gateGroups(r.gates),
     takeItBecause: takeItBecause(r),
     careful: careful(r),

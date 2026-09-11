@@ -222,7 +222,14 @@ const timers = []; // interval handles, cleared on shutdown
     }
 
     server.listen(PORT, () => log.info(`[boot] SPREAD listening on ${PORT}`, { port: PORT }));
+    // The socket plan · the ticker (heartbeat every 10 s, a snapshot a minute,
+    // the final one after the close), the partial pusher (writes / halts /
+    // wake-ups → a partial snapshot within 5 s) and the focus loop (the one
+    // symbol on screen, every 2 s, on change).
     timers.push(startTicker(io));
+    const partial = require('./socket').startPartialPusher(io);
+    timers.push({ stop: partial.stop });
+    timers.push(require('./socket').startFocusLoop(io));
     timers.push(startWakeupScanner(io));
     // Pushes the ROW, every two seconds. The scraper writes symbol_minute,
     // signal_log, position and market_day in another process, and this backend
@@ -271,7 +278,7 @@ async function shutdown(signal) {
   const deadline = setTimeout(() => { log.error('[shutdown] deadline passed, exiting 1'); process.exit(1); }, 5000);
   deadline.unref();
   try {
-    for (const t of timers) if (t) clearInterval(t);
+    for (const t of timers) { if (!t) continue; if (typeof t.stop === "function") t.stop(); else clearInterval(t); }
     await new Promise((r) => io.close(() => r()));
     await new Promise((r) => server.close(() => r()));
     await pool.end();

@@ -249,11 +249,21 @@ const TOOLS = {
         target_ticks: x.targetTicks, not_computed: x.notComputed,
         gates: (x.gates || []).map((g) => ({ label: g.label, ok: g.ok, warn: g.warn, value: g.value })),
       });
-      const rows = [...board.recommended.map((x) => strip(x, 'RECOMMENDED')),
-        ...board.nearMiss.map((x) => strip(x, 'NEAR_MISS'))];
+      // CR-8 · the model sees the same buckets the screen shows — TAKE, ONE
+      // AWAY and PRICE WARN in full, LEAVE and NOT COMPUTED as symbol lists with
+      // the reason, so "why is X not there" has an answer. The boundary still
+      // permits BUY/TAKE only for `recommended` (= TAKE).
+      const rows = [...board.take.map((x) => strip(x, 'TAKE')),
+        ...board.oneAway.map((x) => strip(x, 'ONE_AWAY')),
+        ...board.priceWarn.map((x) => ({ ...strip(x, 'PRICE_WARN'), needs_fils: x.needsFils ?? null }))];
       return { rows, rows_returned: rows.length, day, budget_kd: budgetKd,
-        recommended: board.recommended.map((x) => x.symbol),
-        near_miss: board.nearMiss.map((x) => x.symbol),
+        recommended: board.take.map((x) => x.symbol),
+        take: board.take.map((x) => x.symbol),
+        one_away: board.oneAway.map((x) => x.symbol),
+        near_miss: board.oneAway.map((x) => x.symbol),
+        price_warn: board.priceWarn.map((x) => ({ symbol: x.symbol, needs_fils: x.needsFils ?? null })),
+        leave: board.leave.map((x) => ({ symbol: x.symbol, structural: !!x.structural, reason: x.structuralReason || x.reasons?.[0] || null })),
+        not_computed: board.notComputed.map((x) => ({ symbol: x.symbol, missing: x.notComputed, reason: x.noRowReason || null })),
         counts: board.counts, source: 'live screening pipeline (today)' };
     },
   },

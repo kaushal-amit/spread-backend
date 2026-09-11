@@ -23,8 +23,29 @@ const rules = require('./lib/orderRules');
 const pricing = require('./lib/pricing');
 const { BUDGET, ALERT } = require('./config/spread.config');
 
-const TICK_MS = Number(process.env.TICK_MS || 15000);
+/*
+ * ─── THE SOCKET PLAN (10 Sep) · cadences ─────────────────────────────────────
+ *   SNAPSHOT_MS   one spread:snapshot a minute — board, account, budget,
+ *                 session, market, contracts, feeds, slots — plus a PARTIAL
+ *                 within PARTIAL_DEBOUNCE_MS of any write / halt / wake-up
+ *   HEARTBEAT_MS  spread:tick { seq, at } from the TICKER'S OWN LOOP — if the
+ *                 ticker wedges on a query, the heartbeat stops too; the client
+ *                 declares TICKER DEAD at 3× this
+ *   FOCUS_MS      the ONE symbol a socket is looking at, pushed on change
+ *   FINAL         one snapshot after the close ({ final: true }) at the data
+ *                 window's end + 1 min; then the ticker IDLES (heartbeat only)
+ *                 until PRE_OPEN the next session day
+ * TICK_MS is kept as the legacy name for SNAPSHOT_MS (the env var an operator
+ * may already have set).
+ */
+const SNAPSHOT_MS = Number(process.env.SNAPSHOT_MS || process.env.TICK_MS || 60000);
+const TICK_MS = SNAPSHOT_MS;
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 10000);
+const FOCUS_MS = Number(process.env.FOCUS_MS || 2000);
+const PARTIAL_DEBOUNCE_MS = Number(process.env.PARTIAL_DEBOUNCE_MS || 5000);
+const PRE_OPEN_MINS = 8 * 60 + 45;                 // 08:45 Kuwait — the ticker wakes
 const room = (day) => `day:${day}`;
+const { bus: changeBus } = require('./lib/events');
 
 /*
  * Which symbols have a book on screen.
@@ -157,6 +178,16 @@ function registerHandlers(io) {
     // being pushed to everyone else.
     socket.on('disconnect', () => watchedBySocket.delete(socket.id));
 
+    /*
+     * The socket plan · the ONE symbol this socket is looking at. The focus
+     * loop pushes its quote, book and contract marks every FOCUS_MS when
+     * something changed — the detail poll is gone. null clears it (TODAY).
+     */
+    socket.on('spread:focus', ({ symbol } = {}) => {
+      socket.data.focus = symbol ? String(symbol).toUpperCase() : null;
+      socket.data.focusSig = null;                   // force the first push
+    });
+
     socket.on('spread:subscribe', async ({ date, budget } = {}) => {
       // S-08 · validated like the REST params. A bad payload is answered, not
       // passed to Postgres; and a subscribe costs a board, so it is throttled.
@@ -179,7 +210,10 @@ function registerHandlers(io) {
       // An explicit date is a choice; a subscribe to today keeps following it.
       socket.data.followsToday = d === daily.kuwaitDay();
       socket.data.day = day;
-      socket.emit('spread:update', await view(day, budgetKd));
+      // A subscribe answers with the whole snapshot (and the legacy board alias).
+      const snap = await require('./services/snapshot').snapshot(day, budgetKd, { reason: 'subscribe' });
+      socket.emit('spread:snapshot', snap);
+      if (snap.board) socket.emit('spread:update', snap.board);
     });
 
 
@@ -211,12 +245,12 @@ async function view(day, budgetKd) {
   let screen;
   if (budgetKd == null) {
     boardError = { code: 'NOT_READY', error: 'no session budget is set — set it with PUT /gates {"session-budget": …}' };
-    screen = { recommended: [], nearMiss: [], rejected: [], notComputed: [], counts: {}, reach: null };
+    screen = { take: [], oneAway: [], priceWarn: [], leave: [], recommended: [], nearMiss: [], rejected: [], notComputed: [], counts: {}, reach: null };
   } else {
     screen = await require('./api/routes').board(day, budgetKd).catch((e) => {
       log.warn('[socket] screen:', e.message);
       boardError = { code: e.code || 'BOARD_FAILED', error: 'the board could not be computed — see the server log' };
-      return { recommended: [], nearMiss: [], rejected: [], notComputed: [], counts: {}, reach: null };
+      return { take: [], oneAway: [], priceWarn: [], leave: [], recommended: [], nearMiss: [], rejected: [], notComputed: [], counts: {}, reach: null };
     });
   }
   const { rows: [cov] } = await pool.query(
@@ -233,9 +267,17 @@ async function view(day, budgetKd) {
     // null when the board computed; { code, error } when it did not. A client
     // that sees this must not render the empty buckets as a quiet market.
     error: boardError,
-    recommended: screen.recommended.map((x) => present.stockCandidate(x, budgetKd)),
-    nearMiss: screen.nearMiss.map((x) => present.stockCandidate(x, budgetKd)),
-    rejected: screen.rejected.map((x) => present.stockCandidate(x, budgetKd)),
+    // CR-8 · the four verdict buckets + NOT COMPUTED; the three old names ride
+    // along for one release (recommended = take, nearMiss = oneAway,
+    // rejected = priceWarn + leave). Nothing is removed: the buckets sum to
+    // counts.universe or the screen threw UNIVERSE_MISMATCH and `error` says so.
+    take: (screen.take || []).map((x) => present.stockCandidate(x, budgetKd)),
+    oneAway: (screen.oneAway || []).map((x) => present.stockCandidate(x, budgetKd)),
+    priceWarn: (screen.priceWarn || []).map((x) => present.stockCandidate(x, budgetKd)),
+    leave: (screen.leave || []).map((x) => present.stockCandidate(x, budgetKd)),
+    recommended: (screen.recommended || []).map((x) => present.stockCandidate(x, budgetKd)),
+    nearMiss: (screen.nearMiss || []).map((x) => present.stockCandidate(x, budgetKd)),
+    rejected: (screen.rejected || []).map((x) => present.stockCandidate(x, budgetKd)),
     // SPR-38 · NOT COMPUTED is its own bucket, never folded into rejected.
     notComputed: (screen.notComputed || []).map((x) => present.stockCandidate(x, budgetKd)),
     counts: screen.counts,
@@ -402,65 +444,193 @@ function followDay(io, day) {
   return moved;
 }
 
-function startTicker(io, ms = TICK_MS) {
-  return setInterval(scanner('tick', async () => {
-    const day = daily.kuwaitDay();
+/*
+ * The session-day calendar, once per day: a holiday has no final snapshot and
+ * no session, and the ticker idles on it as it does after the close.
+ */
+const _calDay = { day: null, session: true };
+async function isSessionDay(day) {
+  if (_calDay.day === day) return _calDay.session;
+  const cal = await require('./lib/calendar').sessionDay(day).catch(() => ({ session: true }));
+  _calDay.day = day; _calDay.session = cal.session;
+  return cal.session;
+}
+
+/* The ticker's own clock state — what the heartbeat and /health read. */
+const tickerState = { lastSnapshotAt: 0, lastSnapshotSeq: 0, finalDoneFor: null, phase: null, active: false, lastHeartbeatAt: null };
+
+/** In the window the ticker WORKS: 08:45 → the final snapshot, on a session day. */
+function tickerWindow(now = new Date()) {
+  const p = sessionPhase(now);
+  const k = new Date(now.getTime() + 3 * 3600000);
+  const mins = k.getUTCHours() * 60 + k.getUTCMinutes();
+  const finalAt = require('./lib/session').get().dataWindowEndAt + 1;   // 13:31
+  return { phase: p, mins, preOpen: mins < PRE_OPEN_MINS, pastFinal: mins >= finalAt, weekend: p.phase === 'closed' && p.note === 'weekend' };
+}
+
+/**
+ * The ticker runs every HEARTBEAT_MS. Each run: the heartbeat; then, inside
+ * the window, a full snapshot when SNAPSHOT_MS has elapsed; past the window's
+ * end, ONE final snapshot; otherwise idle. The heartbeat is emitted from
+ * THIS loop on purpose — a wedged snapshot build stops it, which is the point.
+ */
+function startTicker(io, ms = HEARTBEAT_MS, { now: nowFn = () => new Date(), day: dayFn = () => daily.kuwaitDay() } = {}) {
+  const body = scanner('tick', async () => {
+    const now = nowFn();
+    const day = dayFn();
     followDay(io, day);
     const r = room(day);
+    const w = tickerWindow(now);
+    const sessionDay = !w.weekend && await isSessionDay(day);
+    const active = sessionDay && !w.preOpen && !w.pastFinal;
+    tickerState.phase = w.phase.phase; tickerState.active = active;
+    tickerState.lastHeartbeatAt = now.toISOString();
+    const snapshotSvc = require('./services/snapshot');
+    io.to(r).emit('spread:tick', { seq: snapshotSvc.currentSeq(), at: tickerState.lastHeartbeatAt,
+      phase: w.phase.phase, active, final: tickerState.finalDoneFor === day });
     if (!io.sockets.adapter.rooms.get(r)) return 'idle';
-    try {
-      const v = await view(day, require('./services/gateStore').sessionBudgetKd());
-      io.to(r).emit('spread:update', v);
-      announceStops(io, day, v.stops);
-      announceTimeStops(io, day, v.stops);
 
-      /*
-       * B-02 · the order book never refreshed.
-       *
-       * `spread:book` was the only invalidator and nothing emitted it, while
-       * `spread:update` did not touch the order-book key and staleTime was two
-       * minutes. The DOM showed the first-load snapshot indefinitely — on the
-       * one panel where a bid thinning from 41,000 to 5,000 is the whole signal.
-       */
-      /**
-       * The BOOK travels, not just the symbol.
-       *
-       * This emitted { symbol } alone — a refetch signal, which the front-end
-       * contract forbids: "the changed row is pushed, not a signal to refetch.
-       * A refetch defeats in-place updating."
-       *
-       * ADDITIVE, deliberately: `symbol` stays, so a consumer that refetches on
-       * it keeps working, and a new one reads `book` and stops refetching. Drop
-       * `symbol` once nothing uses the refetch path.
-       */
-      for (const symbol of watchedSymbols()) {
-        let book = null;
-        try {
-          const { rows } = await pool.query(`
-            WITH last AS (
-              SELECT max(captured_at) AS at FROM spread.v_depth
-               WHERE symbol = $1 AND trading_date = $2
-            )
-            SELECT DISTINCT ON (level) level, bid, bid_qty, offer, offer_qty, captured_at
-              FROM spread.v_depth d, last l
-             WHERE d.symbol = $1 AND d.trading_date = $2 AND d.captured_at = l.at
-             ORDER BY level`, [symbol, day]);
-          book = {
-            capturedAt: rows.length ? rows[0].captured_at : null,
-            // BookLevel = [price, qty, orders|null]. The third is the order
-            // COUNT, which the broker feed does not carry.
-            b: rows.filter((x) => x.bid !== null).map((x) => [Number(x.bid), Number(x.bid_qty), null]),
-            o: rows.filter((x) => x.offer !== null).map((x) => [Number(x.offer), Number(x.offer_qty), null]),
-          };
-        } catch (e) { /* an empty book is the normal case for 123 of 142 */ }
-        io.to(r).emit('spread:book', { symbol, book });
-      }
+    const budgetKd = require('./services/gateStore').sessionBudgetKd();
+    if (active) {
+      if (now.getTime() - tickerState.lastSnapshotAt < SNAPSHOT_MS) return;  // heartbeat only — still work
+      const snap = await snapshotSvc.snapshot(day, budgetKd, { reason: 'minute' });
+      tickerState.lastSnapshotAt = now.getTime(); tickerState.lastSnapshotSeq = snap.seq;
+      io.to(r).emit('spread:snapshot', snap);
+      // spread:update · the legacy board push, for one release.
+      if (snap.board && !snap.board.error) io.to(r).emit('spread:update', snap.board);
+      const stops = snap.board?.stops;
+      if (stops) { announceStops(io, day, stops); announceTimeStops(io, day, stops); }
       // Only while the market is open. A 12:30 flatten alert once fired at
       // 19:55 because nothing asked the clock first.
-      if (sessionPhase().open) await ruleAlerts(day, io);
-    } catch (e) { throw e; } // recorded and logged by scanner()
-  }), ms);
+      if (sessionPhase(now).open) await ruleAlerts(day, io);
+      return;
+    }
+    if (sessionDay && w.pastFinal && tickerState.finalDoneFor !== day) {
+      // ONE snapshot after the close: the day as it ended, marked final. Then
+      // idle until 08:45 — stats:daily's graded board arrives as a partial.
+      const snap = await snapshotSvc.snapshot(day, budgetKd, { final: true, reason: 'final' });
+      tickerState.finalDoneFor = day; tickerState.lastSnapshotAt = now.getTime(); tickerState.lastSnapshotSeq = snap.seq;
+      io.to(r).emit('spread:snapshot', snap);
+      if (snap.board && !snap.board.error) io.to(r).emit('spread:update', snap.board);
+      log.info(`[tick] final snapshot for ${day} (seq ${snap.seq}) — idling until 08:45`);
+      return;
+    }
+    return 'idle';
+  });
+  const t = setInterval(body, ms);
+  t.run = body;                                   // tests drive one tick by hand
+  return t;
 }
+
+/*
+ * ─── PARTIAL SNAPSHOTS ON WRITE ─────────────────────────────────────────────
+ * A trading write, PUT /gates, a slot swap, a halt, a wake-up announces the
+ * sections it touched (lib/events). Within PARTIAL_DEBOUNCE_MS the union of
+ * those sections is rebuilt and pushed — the operator sees their own order the
+ * moment it is booked; a burst of writes is one push.
+ */
+function startPartialPusher(io, { debounceMs = PARTIAL_DEBOUNCE_MS } = {}) {
+  let pending = new Set(); let reasons = []; let timer = null; let inflight = false;
+  const flush = scanner('partial', async () => {
+    timer = null;
+    if (!pending.size && !reasons.length) return 'idle';
+    const parts = pending.size ? [...pending] : undefined;    // empty = everything
+    const why = reasons.join(', ');
+    pending = new Set(); reasons = [];
+    const day = daily.kuwaitDay();
+    const r = room(day);
+    if (!io.sockets.adapter.rooms.get(r)) return 'idle';
+    inflight = true;
+    try {
+      const snapshotSvc = require('./services/snapshot');
+      const snap = await snapshotSvc.snapshot(day, require('./services/gateStore').sessionBudgetKd(), { parts, reason: why });
+      io.to(r).emit('spread:snapshot', snap);
+      if (snap.board && !snap.board.error) io.to(r).emit('spread:update', snap.board);
+      tickerState.lastSnapshotSeq = snap.seq;
+    } finally { inflight = false; }
+  });
+  const onChanged = ({ parts, reason }) => {
+    if (!parts || !parts.length) pending = new Set(require('./services/snapshot').PARTS);
+    else for (const p of parts) pending.add(p);
+    reasons.push(reason);
+    if (!timer) timer = setTimeout(() => { Promise.resolve(flush()).catch((e) => log.warn('[partial]', e.message)); }, debounceMs);
+  };
+  changeBus.on('changed', onChanged);
+  const handle = { stop: () => { changeBus.off('changed', onChanged); if (timer) clearTimeout(timer); }, pending: () => [...pending], inflight: () => inflight };
+  // setInterval-shaped for index.js's timers list: clearInterval on a plain
+  // object is a no-op, so expose stop() and return the handle.
+  return handle;
+}
+
+/*
+ * ─── THE FOCUS LOOP ────────────────────────────────────────────────────────
+ * Every FOCUS_MS, for each socket with a focus symbol: the latest quote, the
+ * latest book capture and the open contract's marks for THAT symbol — pushed
+ * only when something changed (a signature of the three timestamps / the
+ * marks). The other 139 symbols cost nothing; the ladder the operator is
+ * staring at moves at capture speed.
+ */
+async function focusPayload(symbol, day, contractsForDay) {
+  const positions = require('./api/positions');
+  const q = await positions.latestQuote(symbol, day);
+  const { rows } = await pool.query(`
+    WITH last AS (SELECT max(captured_at) AS at FROM spread.v_depth WHERE symbol = $1 AND trading_date = $2)
+    SELECT DISTINCT ON (level) level, bid, bid_qty, offer, offer_qty, captured_at
+      FROM spread.v_depth d, last l
+     WHERE d.symbol = $1 AND d.trading_date = $2 AND d.captured_at = l.at
+     ORDER BY level`, [symbol, day]);
+  const book = {
+    capturedAt: rows.length ? rows[0].captured_at : null,
+    b: rows.filter((x) => x.bid !== null).map((x) => [Number(x.bid), Number(x.bid_qty), null]),
+    o: rows.filter((x) => x.offer !== null).map((x) => [Number(x.offer), Number(x.offer_qty), null]),
+  };
+  const contract = (contractsForDay || []).find((c) => c.symbol === symbol) || null;
+  const quote = q ? { last: q.last_price == null ? null : Number(q.last_price), bid: q.bid == null ? null : Number(q.bid),
+    bidQty: q.bid_qty == null ? null : Number(q.bid_qty), offer: q.offer == null ? null : Number(q.offer),
+    offerQty: q.offer_qty == null ? null : Number(q.offer_qty), at: q.created_at } : null;
+  const sig = `${quote?.at ? new Date(quote.at).toISOString() : '-'}|${book.capturedAt ? new Date(book.capturedAt).toISOString() : '-'}|${contract ? JSON.stringify([contract.bid, contract.unrealisedKd, contract.state, contract.shares]) : '-'}`;
+  return { payload: { symbol, at: new Date().toISOString(), quote, book, contract }, sig };
+}
+
+function startFocusLoop(io, { everyMs = FOCUS_MS, day: dayFn = () => daily.kuwaitDay() } = {}) {
+  return setInterval(scanner('focus', async () => {
+    const focused = [...io.sockets.sockets.values()].filter((s) => s.data?.focus);
+    if (!focused.length) return 'idle';
+    const day = dayFn();
+    // contracts() once per tick, only when someone is focused.
+    const contracts = await require('./api/routes').contracts(day).catch(() => []);
+    const cache = new Map();                              // symbol -> { payload, sig }
+    for (const s of focused) {
+      const sym = s.data.focus;
+      if (!cache.has(sym)) cache.set(sym, await focusPayload(sym, day, contracts));
+      const { payload, sig } = cache.get(sym);
+      if (s.data.focusSig === sig) continue;              // nothing changed — no push
+      s.data.focusSig = sig;
+      s.emit('spread:focus', payload);
+    }
+  }), everyMs);
+}
+
+/** /health · which loops are silent beyond their limit, IN THE TICKER'S WINDOW. */
+function deadLoops({ now = new Date(), force = false } = {}) {
+  const w = tickerWindow(new Date(now));
+  if (!force && (w.weekend || w.preOpen || w.pastFinal)) return [];
+  const t = new Date(now).getTime();
+  const out = [];
+  const check = (name, limitMs) => {
+    const h = _scannerHealth[name];
+    if (!h) return;
+    const last = h.lastSuccessAt ? new Date(h.lastSuccessAt).getTime() : null;
+    // A loop that has never run since boot is not dead at boot: give it one limit.
+    const bootAt = _bootAt;
+    const ref = last ?? bootAt;
+    if (t - ref > limitMs) out.push({ name, silentSec: Math.round((t - ref) / 1000), limitSec: Math.round(limitMs / 1000), lastSuccessAt: h.lastSuccessAt });
+  };
+  check('tick', 3 * HEARTBEAT_MS);
+  check('rowPoller', 5 * Number(process.env.ROW_POLL_MS || 2000));
+  return out;
+}
+const _bootAt = Date.now();
 
 /**
  * ─── THE ROW POLLER ────────────────────────────────────────────────────────
@@ -484,6 +654,7 @@ function startRowPoller(io, { everyMs = POLL_MS } = {}) {
   // Where each stream was last read. Seeded on the first tick from the table's
   // own maximum, so a restart does not replay a whole session into a socket.
   const seen = { minute: null, signal: null, position: null, market: null };
+  const bookSeen = new Map();                           // symbol -> last captured_at ms pushed
   let seeding = true;
 
   return setInterval(scanner('rowPoller', async () => {
@@ -510,6 +681,30 @@ function startRowPoller(io, { everyMs = POLL_MS } = {}) {
         });
         seeding = false;
         return 'idle';
+      }
+
+      /*
+       * The socket plan · BOOKS ON CHANGE. The ticker used to push every
+       * watched book every 15 s whether or not the sweep had captured anything.
+       * Now: the latest captured_at per watched symbol (one query); a symbol
+       * whose capture ADVANCED gets its book pushed; the rest get nothing — a
+       * tile that stops receiving is a tile whose capture stopped, the truth.
+       */
+      const watchedNow = [...watchedSymbols()];
+      if (watchedNow.length) {
+        const { rows: caps } = await pool.query(
+          `SELECT symbol, max(captured_at) AS at FROM spread.v_depth
+            WHERE symbol = ANY($1) AND trading_date = $2 GROUP BY symbol`, [watchedNow, day]);
+        const latest = new Map(caps.map((c) => [c.symbol, new Date(c.at).getTime()]));
+        for (const symbol of watchedNow) {
+          const at = latest.get(symbol) ?? null;
+          const seenAt = bookSeen.get(symbol);
+          if (seenAt !== undefined && seenAt === at) continue;   // unchanged — no push
+          bookSeen.set(symbol, at);
+          const { payload } = await focusPayload(symbol, day, null).catch(() => ({ payload: null }));
+          io.to(r).emit('spread:book', { symbol, book: payload ? payload.book : { capturedAt: null, b: [], o: [] } });
+        }
+        for (const k of [...bookSeen.keys()]) if (!watchedNow.includes(k)) bookSeen.delete(k);
       }
 
       // symbol_minute -> only the sockets watching that symbol. A trader with
@@ -580,6 +775,7 @@ function startWakeupScanner(io, { times = WAKE_TIMES, everyMs = 60000 } = {}) {
       io.to(room(day)).emit('spread:wakeup', { day, at: hhmm, flagged,
         // Most stocks have barely traded by 09:30 and the ratios are unstable.
         lowConfidence: hhmm === '09:30' });
+      if (flagged.length) require('./lib/events').changed(['board', 'slots'], `wake-up ${hhmm}`);
       log.info(`[wakeup] ${hhmm}: ${flagged.length} flagged`);
     } catch (e) { throw e; } // recorded and logged by scanner()
   }), everyMs);
@@ -725,6 +921,7 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
       for (const res of r.resumes) {
         // THE ALERT. The verdict is already computed — two minutes is the trade.
         io.to(roomId).emit('spread:halt', { phase: 'RESUME', audible: res.tradeable, ...res });
+        require('./lib/events').changed(['board', 'slots'], `resume ${res.symbol}`);
         log.info(`[halt] ${res.symbol} resumed ${res.resumePrice} — ${res.verdict}`);
         // H-D1 · THE DELIVERY PATH. Every TRADEABLE resume attempts delivery
         // within this scan and the attempt is RECORDED on the halt_event row, so
@@ -791,4 +988,6 @@ function startFeedHealthScanner(io, { everyMs = 120000 } = {}) {
 
 module.exports = { registerHandlers, startTicker, startWakeupScanner, startAlertScanner, followDay,
   ruleAlerts, sessionPhase, view, watchedSymbols, watchedBySocket, startRowPoller, announceStops,
-  startHaltScanner, startFeedHealthScanner, scannerHealth, scanner };
+  startHaltScanner, startFeedHealthScanner, scannerHealth, scanner,
+  startPartialPusher, startFocusLoop, focusPayload, deadLoops, tickerWindow, tickerState,
+  SNAPSHOT_MS, HEARTBEAT_MS, FOCUS_MS, PARTIAL_DEBOUNCE_MS };

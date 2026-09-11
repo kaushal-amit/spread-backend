@@ -28,7 +28,10 @@ const { dayParam, symbolParam, amountParam } = require('./params');
 const LEG_STATUS = ['POSTED', 'FILLED', 'CANCELLED', 'EXPIRED', 'CARRIED', 'AUCTION_SUBMITTED'];
 
 /** The board cache lives in routes.js; resolved late because the require is circular. */
-function invalidate() { return require('./routes').invalidate(); }
+// Every trading write touches the account, the contracts, the board (open
+// symbols, stops) and the session (the stops). Announced so the socket pushes
+// a partial snapshot at once (lib/events).
+function invalidate(reason = 'trade') { return require('./routes').invalidate(['account', 'contracts', 'board', 'session'], reason); }
 const contracts = positions.contracts;
 
 /** Two cash rows for a fill, on the transaction client. */
