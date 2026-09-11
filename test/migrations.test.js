@@ -68,7 +68,11 @@ for (const f of files) {
       // 039 seeds the exchange holidays and downgrades a day only WHERE NOT
       // EXISTS quotes in public.awsat_market_quotes — real Postgres only;
       // the calendar is exercised in phase0 scenario H / stats.
-      || f === '039_holidays_2026.sql') {
+      || f === '039_holidays_2026.sql'
+      // 041 adds NOT VALID check constraints and a partial index on order_leg,
+      // like 017 — real Postgres only; exercised in partialfill / stophit /
+      // sizeband against kse_test.
+      || f === '041_partial_fill_stop_override.sql') {
     chk(f + '  skipped here — needs real Postgres and public.* tables',
        true, 'verified in views.test.js against a kse-shaped database');
     continue;

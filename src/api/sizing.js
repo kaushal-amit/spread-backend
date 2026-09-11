@@ -273,6 +273,35 @@ async function budgetView() {
   };
 }
 
+/**
+ * F7 · "Free 720 — MRC fits, KHOT needs 120 more". The TAKE cards, in board
+ * order, against the free KD: each needs its card's headroom.minKd (the
+ * symbol's min_budget_kd from stats:daily); a card whose minimum is not
+ * computed is listed as such, never assumed to fit. Greedy, like the
+ * reference: the first card takes its share, the next sees what is left.
+ * Pure — the snapshot calls it with the presented take list and free_kd.
+ */
+function fits(takeCards, freeKd) {
+  const free = freeKd == null ? null : Number(freeKd);
+  if (free == null) return { freeKd: null, items: [], line: 'free KD not known' };
+  let remaining = free;
+  const items = [];
+  for (const c of takeCards || []) {
+    const need = c?.headroom?.minKd;
+    if (need == null) { items.push({ symbol: c.symbol, needKd: null, computed: false, fits: null, deficitKd: null }); continue; }
+    const n = Number(need);
+    if (remaining >= n) { items.push({ symbol: c.symbol, needKd: n, computed: true, fits: true, deficitKd: 0 }); remaining -= n; }
+    else { items.push({ symbol: c.symbol, needKd: n, computed: true, fits: false, deficitKd: Number((n - remaining).toFixed(3)) }); remaining = 0; }
+  }
+  const f = (n) => Math.round(n).toLocaleString('en-US');
+  const fit = items.filter((i) => i.fits === true), miss = items.filter((i) => i.fits === false), unk = items.filter((i) => !i.computed);
+  let line;
+  if (!items.length) line = `Free ${f(free)} — nothing to fit`;
+  else if (!miss.length && !unk.length) line = `Free ${f(free)} — ${fit.length === items.length && items.length > 1 ? `all ${items.length} fit` : `${fit.map((i) => i.symbol).join(', ')} fit${fit.length === 1 ? 's' : ''}`}, ${f(remaining)} left over`;
+  else line = `Free ${f(free)} — ${fit.length ? `${fit.map((i) => i.symbol).join(', ')} fit${fit.length === 1 ? 's' : ''}` : 'nothing fits'}${miss.length ? `, ${miss.map((i) => `${i.symbol} needs ${f(i.deficitKd)} more`).join(', ')}` : ''}${unk.length ? `; ${unk.map((i) => i.symbol).join(', ')} minimum not computed` : ''}`;
+  return { freeKd: free, remainingKd: Number(remaining.toFixed(3)), items, line };
+}
+
 function build() {
   const r = express.Router();
 
@@ -298,4 +327,4 @@ function build() {
   return r;
 }
 
-module.exports = { build, sizingFor, thresholds, budgetKd, budgetView };
+module.exports = { build, sizingFor, thresholds, budgetKd, budgetView, fits };

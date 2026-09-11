@@ -54,13 +54,17 @@ const fakeSocket = (id, focus = null) => {
     chk('session section = GET /session (same keys)', keys(snap.session) === keys(sess), { a: keys(snap.session), b: keys(sess) });
     chk('market section = GET /market', keys(snap.market) === keys(mkt));
     chk('account section = GET /account', keys(snap.account) === keys(acct));
-    chk('budget section = GET /budget', keys(snap.budget) === keys(bud));
+    // F7 · the fits line is the ONE addition the snapshot makes to /budget:
+    // the TAKE cards against free_kd, computed only when both sections built.
+    chk('budget section = GET /budget + fits', keys(snap.budget) === keys({ ...bud, fits: 1 }), { a: keys(snap.budget), b: keys(bud) });
+    chk('  fits names the free KD and a line', snap.budget.fits && snap.budget.fits.freeKd === bud.free_kd && typeof snap.budget.fits.line === 'string' && Array.isArray(snap.budget.fits.items), snap.budget.fits);
     chk('contracts section = GET /trading/contracts', Array.isArray(snap.contracts) && snap.contracts.length === con.length);
     chk('board section carries the CR-8 buckets and stops', snap.board && Array.isArray(snap.board.take) && 'stops' in snap.board, snap.board && Object.keys(snap.board));
     chk('slots section says NOT_READY when the scraper is not configured — an error, never a silent []',
         snap.slots && snap.slots.error && snap.slots.error.code === 'NOT_READY', snap.slots);
     const part = await snapshotSvc.snapshot(DAY, 790, { parts: ['account', 'budget'], reason: 'trade' });
     chk('a partial carries only its parts, marked', part.partial === true && part.parts.join() === 'account,budget' && !('board' in part) && 'account' in part);
+    chk('  a budget partial without the board carries no fits (nothing to fit against)', !('fits' in part.budget), part.budget && Object.keys(part.budget));
     chk('seq is monotonic', part.seq === snap.seq + 1);
     const broken = await snapshotSvc.snapshot(DAY, null, { parts: ['board'] });
     chk('a section that cannot be built is an ERROR in the snapshot, not a quiet empty board', broken.board && broken.board.error && broken.board.error.code === 'NOT_READY', broken.board && broken.board.error);

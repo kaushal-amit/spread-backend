@@ -40,14 +40,13 @@ const find = (b, s) => all(b).find((r) => r.symbol === s);
     for (const s of syms) {
       await fx.clearQuotes(s).catch(() => {}); await fx.clearSymbolDay(s).catch(() => {});
       await pool.query('DELETE FROM spread.symbol_profile WHERE symbol = $1', [s]).catch(() => {});
-      await pool.query('DELETE FROM public.symbol_day WHERE symbol = $1', [s]).catch(() => {});
       await fx.clearInstruments(s).catch(() => {});
     }
   };
   try {
     await clean();
     for (const s of syms) await fx.instrument(s);
-    await pool.query('UPDATE public.instruments SET is_tradeable = false, broker_status = $2 WHERE symbol = $1', [SUSP, 'DELISTED']);
+    await fx.setInstrumentStatus(SUSP, { tradeable: false, brokerStatus: 'DELISTED' });
     // ABAR: a row on LAST only — never on DAY.
     await fx.symbolDay(ABAR, LAST, { close: 210 });
     // the others: a row on DAY

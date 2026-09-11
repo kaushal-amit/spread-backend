@@ -267,6 +267,11 @@ function bind(pool) {
     },
     clearDepthSlots: (day) => pool.query('DELETE FROM public.depth_watchlist WHERE trading_date = $1::date', [day]),
     clearSymbolDay: (sym) => { assertTestSymbol(sym); return pool.query('DELETE FROM public.symbol_day WHERE symbol = $1', [sym]); },
+    /** public.instruments — mark a test instrument suspended / delisted (CR-8 SUSPENDED rows). */
+    setInstrumentStatus: (sym, { tradeable = true, brokerStatus = null } = {}) => {
+      assertTestSymbol(sym);
+      return pool.query('UPDATE public.instruments SET is_tradeable = $2, broker_status = $3 WHERE symbol = $1', [sym, tradeable, brokerStatus]);
+    },
 
     /** public.awsat_order_list — a broker fill the reconciliation matches. */
     brokerOrder: (row) => {

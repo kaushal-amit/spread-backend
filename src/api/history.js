@@ -132,6 +132,17 @@ async function orders({ from = null, to = null, limit = 500, cursor = null, db =
     if (c.legs.some((l) => l.status === 'EXPIRED')) {
       flags.push({ flag: 'EXPIRED', severity: 'warning', why: 'still live at the close' });
     }
+    // F3 / F4 · taken anyway: outside the sizing band or not TAKE, with the
+    // operator's reason on the leg. Counted below so the habit is visible.
+    const overridden = c.legs.find((l) => l.is_override);
+    if (overridden) {
+      flags.push({ flag: 'OVERRIDE', severity: 'warning',
+        why: `taken anyway — ${overridden.override_reason || 'no reason recorded'}` });
+    }
+    // F2 · the stop recorded at the fill was hit.
+    if (c.legs.some((l) => l.stop_hit_at)) {
+      flags.push({ flag: 'STOP_HIT', severity: 'danger', why: 'the bid printed through the stop set at the fill' });
+    }
 
     out.push({
       key: c.key, symbol: c.symbol, contractDay: c.contractDay, seq: c.seq,
@@ -153,6 +164,10 @@ async function orders({ from = null, to = null, limit = 500, cursor = null, db =
         commission_kd: Number(l.commission_kd || 0),
         executions: l.executions == null ? null : Number(l.executions),
         placement: l.placement, brokerOrderId: l.broker_order_id,
+        isOverride: !!l.is_override, overrideReason: l.override_reason || null,
+        restStatus: l.rest_status || null,
+        stopFils: l.stop_fils == null ? null : Number(l.stop_fils),
+        stopHitAt: l.stop_hit_at ? new Date(l.stop_hit_at).toISOString() : null,
         time: l.posted_at ? new Date(l.posted_at).toISOString() : '',
         resolvedAt: l.resolved_at ? new Date(l.resolved_at).toISOString() : null,
         note: l.note || '',
@@ -196,6 +211,9 @@ async function orders({ from = null, to = null, limit = 500, cursor = null, db =
       fillRatePct: allLegs ? Number(((100 * fillsTotal) / allLegs).toFixed(1)) : 0,
       exitsAsPosted, exitsMovedDown,
       contractsClosed: out.filter((c) => c.state === 'closed').length,
+      // F3 / F4 · how often the band or the board was overridden; F2 · stops hit.
+      overrides: out.filter((c) => c.flags.some((f) => f.flag === 'OVERRIDE')).length,
+      stopsHit: out.filter((c) => c.flags.some((f) => f.flag === 'STOP_HIT')).length,
     },
   };
 }

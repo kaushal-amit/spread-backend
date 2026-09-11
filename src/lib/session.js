@@ -36,6 +36,11 @@ const DEFAULTS = {
   openAt: hhmmToMins(SESSION.openAt),               // 09:00
   closeAt: hhmmToMins(SESSION.closeAt),             // 13:00 · continuous trading ends → canOpen false
   auctionCloseAt: hhmmToMins(SESSION.auctionCloseAt), // 13:25
+  // F5 · Trading at Last: 13:10–13:30, trades at the closing-auction price only.
+  // No new position; an OPEN position may still be closed (canClose) — the last
+  // honest exit of the day, not "into the auction".
+  talStartAt: hhmmToMins(SESSION.talStartAt),       // 13:10
+  talEndAt: hhmmToMins(SESSION.talEndAt),           // 13:30
   dataWindowEndAt: 13 * 60 + 30,                    // 13:30 · captures after this are a stuck script
   stepDownAt: hhmmToMins(EXIT.stepDownAtClock),     // 11:00
   lateSessionAt: 12 * 60,                           // 12:00
@@ -68,7 +73,8 @@ function get() {
   return { ...c,
     stepDownClock: minsToClock(c.stepDownAt), lateSessionClock: minsToClock(c.lateSessionAt),
     hardExitClock: minsToClock(c.hardExitAt), flatByClock: minsToClock(c.flatByAt),
-    closeClock: minsToClock(c.closeAt), dataWindowEndClock: minsToClock(c.dataWindowEndAt) };
+    closeClock: minsToClock(c.closeAt), dataWindowEndClock: minsToClock(c.dataWindowEndAt),
+    talStartClock: minsToClock(c.talStartAt), talEndClock: minsToClock(c.talEndAt) };
 }
 
 /** Kuwait wall-clock minutes and weekday of an instant. */
@@ -80,24 +86,29 @@ function kuwait(now = new Date()) {
 /**
  * The phase. `open` = a new position may be opened as far as the CLOCK is
  * concerned (Sun–Thu, 09:00 ≤ t < 13:00; the stops and the calendar have
- * their own say). `dataWindow` = a capture now is a live capture (t < 13:30).
+ * their own say). `canClose` = an open position may be CLOSED now: while open,
+ * and during Trading at Last (13:10–13:30, at the auction price only — F5).
+ * `tal` is that window. `dataWindow` = a capture now is a live capture (t < 13:30).
  */
 function sessionPhase(now = new Date()) {
   const c = clocks;
   const { mins, dow } = kuwait(now);
-  const dataWindow = dow !== 5 && dow !== 6 && mins < c.dataWindowEndAt;
+  const weekend = dow === 5 || dow === 6;
+  const dataWindow = !weekend && mins < c.dataWindowEndAt;
+  const tal = !weekend && mins >= c.talStartAt && mins < c.talEndAt;
   const base = {
     minutesToStepDown: Math.max(0, c.lateSessionAt - mins),
     pastStepDown: mins >= c.stepDownAt, pastHardExit: mins >= c.hardExitAt, pastFlatBy: mins >= c.flatByAt,
-    dataWindow, clocks: get(),
+    dataWindow, tal, canClose: false, clocks: get(),
   };
-  if (dow === 5 || dow === 6) return { ...base, open: false, phase: 'closed', note: 'weekend', minutesToStepDown: 0 };
+  if (weekend) return { ...base, open: false, phase: 'closed', note: 'weekend', minutesToStepDown: 0 };
   if (mins < c.openAt) return { ...base, open: false, phase: 'pre_open', note: `opens at ${minsToClock(c.openAt)}` };
-  if (mins >= c.closeAt) return { ...base, open: false, phase: 'closed', note: mins < c.auctionCloseAt ? 'closing auction — no new positions' : 'session over', minutesToStepDown: 0 };
-  if (mins < c.openAt + 60) return { ...base, open: true, phase: 'open', note: 'first hour — widest spreads' };
-  if (mins < c.stepDownAt) return { ...base, open: true, phase: 'peak', note: 'peak hour' };
-  if (mins < c.lateSessionAt) return { ...base, open: true, phase: 'step_down', note: 'past the step-down' };
-  return { ...base, open: true, phase: 'late', note: 'last hour — drift is negative' };
+  if (tal) return { ...base, open: false, canClose: true, phase: 'tal', note: `Trading at Last to ${minsToClock(c.talEndAt)} — close at the auction price only, no new positions`, minutesToStepDown: 0 };
+  if (mins >= c.closeAt) return { ...base, open: false, phase: 'closed', note: mins < c.talStartAt ? `closing auction — no new positions; Trading at Last opens ${minsToClock(c.talStartAt)}` : 'session over', minutesToStepDown: 0 };
+  if (mins < c.openAt + 60) return { ...base, open: true, canClose: true, phase: 'open', note: 'first hour — widest spreads' };
+  if (mins < c.stepDownAt) return { ...base, open: true, canClose: true, phase: 'peak', note: 'peak hour' };
+  if (mins < c.lateSessionAt) return { ...base, open: true, canClose: true, phase: 'step_down', note: 'past the step-down' };
+  return { ...base, open: true, canClose: true, phase: 'late', note: 'last hour — drift is negative' };
 }
 
 module.exports = { load, get, sessionPhase, kuwait, hhmmToMins, minsToClock, DEFAULTS };

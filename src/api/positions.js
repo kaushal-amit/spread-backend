@@ -48,6 +48,31 @@ const OPEN_BUY = (l = 'l') => `
 const REMAINING = (l = 'l') => `(COALESCE(${l}.filled_shares, ${l}.shares) - ${SOLD(l)})`;
 
 /**
+ * F1 · a RESTING order: a POSTED leg, or the remainder of a partial fill
+ * (a FILLED leg whose rest_status is 'POSTED' — the part still queued in
+ * Awsat, on the same leg, the same contract). One filled buy per contract
+ * (017) is kept: the rest fills INTO the leg, never as a second buy.
+ * `rest_status IS NULL` on a partial leg is "not tracked" (pre-041) — never
+ * read as resting.
+ */
+const RESTING = (l = 'l') => `(${l}.status = 'POSTED' OR (${l}.status = 'FILLED' AND ${l}.rest_status = 'POSTED'))`;
+/** Shares of that leg still queued. */
+const RESTING_SHARES = (l = 'l') =>
+  `(CASE WHEN ${l}.status = 'POSTED' THEN ${l}.shares ELSE ${l}.shares - COALESCE(${l}.filled_shares, 0) END)`;
+
+/** The resting legs of a symbol (POSTED, and partial remainders), oldest first. */
+async function restingLegs(symbol, db = pool, { side = null, contractSeq = null } = {}) {
+  const { rows } = await db.query(
+    `SELECT l.*, ${RESTING_SHARES('l')} AS resting_shares
+       FROM spread.order_leg l
+      WHERE l.symbol = $1 AND ${RESTING('l')}
+        AND ($2::text IS NULL OR l.side = $2)
+        AND ($3::int IS NULL OR l.contract_seq = $3)
+      ORDER BY l.posted_at, l.id;`, [symbol, side, contractSeq]);
+  return rows.map((r) => ({ ...r, resting_shares: Number(r.resting_shares) }));
+}
+
+/**
  * The open buy for a symbol, with its remaining quantity, or null.
  * `db` may be a transaction client — callers inside BEGIN must pass it.
  */
@@ -63,8 +88,9 @@ async function openBuy(symbol, db = pool) {
 /** Every open buy, for the account. */
 async function openBuys(db = pool) {
   const { rows } = await db.query(
-    `SELECT l.symbol, l.contract_seq, l.price_fils, l.commission_kd, l.trading_day,
-            l.carried_from_day, l.posted_at, l.peak_bid_fils, l.status,
+    `SELECT l.id, l.symbol, l.contract_seq, l.price_fils, l.commission_kd, l.trading_day,
+            l.carried_from_day, l.posted_at, l.resolved_at, l.peak_bid_fils, l.status,
+            l.stop_fils, l.stop_hit_at, l.rest_status, l.shares,
             COALESCE(l.filled_shares, l.shares) AS bought_shares,
             ${REMAINING('l')} AS remaining_shares
        FROM spread.order_leg l
@@ -105,6 +131,23 @@ async function latestQuote(symbol, day, db = pool) {
             last_price::numeric AS last_price, trades, created_at
        FROM spread.v_quote_screening
       WHERE symbol = $1 AND trading_date = $2
+      ORDER BY created_at DESC LIMIT 1;`, [symbol, day]);
+  return q || null;
+}
+
+/**
+ * F5 · the latest executable print AFTER continuous trading — Trading at Last
+ * / Close-Of-Day rows (spread.v_quote carries them; v_quote_screening does
+ * not). This is the auction price a position closes at in TAL. null = no
+ * such print today yet.
+ */
+async function latestClosePrint(symbol, day, db = pool) {
+  const { rows: [q] } = await db.query(
+    `SELECT last_price::numeric AS last_price, bid::numeric AS bid, offer::numeric AS offer,
+            session, created_at
+       FROM spread.v_quote
+      WHERE symbol = $1 AND trading_date = $2
+        AND session IN ('Trading at Last', 'Close-Of-Day')
       ORDER BY created_at DESC LIMIT 1;`, [symbol, day]);
   return q || null;
 }
@@ -241,6 +284,11 @@ async function contracts(day, db = pool) {
       openedOn,
       markedAt: q ? 'quote' : 'entry',
       quoteAt: q?.created_at || null,
+      // F2 · the stop recorded at the fill (fixed), and when the bid printed
+      // through it. F1 · the remainder of a partial buy still resting.
+      stopFils: b.stop_fils == null ? null : Number(b.stop_fils),
+      stopHitAt: b.stop_hit_at || null,
+      restingBuyShares: b.rest_status === 'POSTED' ? Number(b.shares) - Number(b.bought_shares) : 0,
       legs,
     }));
   }
@@ -254,13 +302,14 @@ async function contracts(day, db = pool) {
       shares: 0, entry: null, bid: null, offer: null,
       committedKd: Number(cl.amount_kd), unrealisedKd: null,
       breakEvenFils: null, targetNormalFils: null, targetTrendingFils: null, peakBidFils: null,
-      boughtShares: 0, openedOn: toDay(cl.trading_day), markedAt: null, quoteAt: null, legs: [],
+      boughtShares: 0, openedOn: toDay(cl.trading_day), markedAt: null, quoteAt: null,
+      stopFils: null, stopHitAt: null, restingBuyShares: 0, legs: [],
     }));
   }
   return out;
 }
 
 module.exports = {
-  OPEN_BUY, REMAINING, SOLD, openBuy, openBuys, allocateSeq, latestQuote, isPremier,
-  pnlSummary, accountSummary, contracts,
+  OPEN_BUY, REMAINING, SOLD, RESTING, RESTING_SHARES, openBuy, openBuys, restingLegs, allocateSeq,
+  latestQuote, latestClosePrint, isPremier, pnlSummary, accountSummary, contracts,
 };

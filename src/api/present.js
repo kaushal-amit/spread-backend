@@ -446,27 +446,50 @@ function tradingContract(c) {
     // (unrealised then reads 0.00 and must not be trusted), null for a claim.
     markedAt: c.markedAt ?? null,
     quoteAt: c.quoteAt ? new Date(c.quoteAt).toISOString() : null,
-    legs: (c.legs || []).map((l) => ({
-      id: Number(l.id),
-      contractId: Number(c.contract_seq ?? c.seq ?? 1),
-      symbol: c.symbol,
-      time: l.posted_at ? new Date(l.posted_at).toISOString() : '',
-      side: l.side,
-      status: l.status,
-      price: n2(l.price_fils),
-      shares: Number(l.shares || 0),
-      commission_kd: n3(l.commission_kd),
-      note: l.note || '',
-    })),
+    // F2 · the stop fixed at the fill; stopHitAt once the bid printed through
+    // it (the STOP HIT state). null stop = no aged shelf when it filled.
+    stopFils: n2n(c.stopFils),
+    stopHitAt: c.stopHitAt ? new Date(c.stopHitAt).toISOString() : null,
+    // F1 · PART FILLED: the buy's remainder still resting (0 when whole or
+    // resolved). The state is holding + a queued rest, on one contract.
+    restingBuyShares: Number(c.restingBuyShares || 0),
+    legs: (c.legs || []).map(legView.bind(null, c)),
+  };
+}
+
+/** One leg as the SPA reads it, with the partial-fill remainder made visible. */
+function legView(c, l) {
+  return {
+    id: Number(l.id),
+    contractId: Number(c.contract_seq ?? c.seq ?? 1),
+    symbol: c.symbol,
+    time: l.posted_at ? new Date(l.posted_at).toISOString() : '',
+    side: l.side,
+    status: l.status,
+    price: n2(l.price_fils),
+    shares: Number(l.shares || 0),
+    filledShares: l.filled_shares == null ? null : Number(l.filled_shares),
+    commission_kd: n3(l.commission_kd),
+    // F1 · 'POSTED' = the rest of this partial fill is still queued; the
+    // shares are what is queued. null = whole, or not tracked (pre-041).
+    restStatus: l.rest_status || null,
+    restingShares: l.status === 'POSTED' ? Number(l.shares || 0)
+      : l.rest_status === 'POSTED' ? Number(l.shares || 0) - Number(l.filled_shares || 0) : 0,
+    isOverride: !!l.is_override,
+    note: l.note || '',
   };
 }
 
 /** Session phase. Every clock display asks this before rendering. */
 function sessionInfo(p, drift) {
+  // lib/session's phases → the SPA's: the first hour reads `calm`, the last
+  // hour folds into `step_down`; `tal` (F5, Trading at Last) is its own —
+  // no new position, an open one may still be closed at the auction price.
   const phaseMap = { pre_open: 'pre_open', open: 'calm', peak: 'peak',
-    step_down: 'step_down', late: 'step_down', closed: 'closed' };
+    step_down: 'step_down', late: 'step_down', tal: 'tal', closed: 'closed' };
   return {
     phase: phaseMap[p.phase] || 'closed',
+    canClose: !!p.canClose,
     hour: p.hour ?? 0,
     timeStr: p.timeStr || '',
     driftVsOpen: drift ?? 0,
@@ -608,6 +631,6 @@ function gateConfigs(cfg = null, meta = {}) {
 module.exports = {
   health,
   marketDay,
-  stockCandidate, orderBook, accountState, ledgerEntry, tradingContract,
+  stockCandidate, orderBook, accountState, ledgerEntry, tradingContract, legView,
   sessionInfo, gateConfigs, gateGroups,
 };

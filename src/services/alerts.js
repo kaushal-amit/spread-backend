@@ -179,14 +179,17 @@ async function stranded(day, { db = pool } = {}) {
    * "not checked" every ten minutes, is noise that hides the real alert. Such
    * legs are returned separately as `stale`, once, so they get resolved.
    */
+  // F1 · RESTING = POSTED, or the queued rest of a partial fill (positions.RESTING).
+  const positions = require('../api/positions');
   const { rows: legs } = await db.query(
-    `SELECT l.id, l.symbol, l.contract_seq, l.side, l.price_fils, l.shares, l.posted_at, l.trading_day,
+    `SELECT l.id, l.symbol, l.contract_seq, l.side, l.price_fils, l.posted_at, l.trading_day,
+            ${positions.RESTING_SHARES('l')} AS shares,
             (l.trading_day = $1::date
              OR EXISTS (SELECT 1 FROM spread.order_leg b
                          WHERE b.symbol = l.symbol AND b.contract_seq = l.contract_seq
                            AND b.side = 'BUY' AND b.status IN ('FILLED','CARRIED'))) AS live
        FROM spread.order_leg l
-      WHERE l.status = 'POSTED'
+      WHERE ${positions.RESTING('l')}
       ORDER BY l.symbol, l.posted_at;`, [day]);
   const rules = require('../lib/orderRules');
   const { latestQuote } = require('../api/positions');

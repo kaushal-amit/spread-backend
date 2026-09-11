@@ -484,7 +484,7 @@ function startTicker(io, ms = HEARTBEAT_MS, { now: nowFn = () => new Date(), day
     const sessionDay = !w.weekend && await isSessionDay(day);
     const active = sessionDay && !w.preOpen && !w.pastFinal;
     tickerState.phase = w.phase.phase; tickerState.active = active;
-    tickerState.lastHeartbeatAt = now.toISOString();
+    tickerState.lastHeartbeatAt = new Date(now).toISOString();
     const snapshotSvc = require('./services/snapshot');
     io.to(r).emit('spread:tick', { seq: snapshotSvc.currentSeq(), at: tickerState.lastHeartbeatAt,
       phase: w.phase.phase, active, final: tickerState.finalDoneFor === day });
@@ -660,6 +660,30 @@ function startRowPoller(io, { everyMs = POLL_MS } = {}) {
   return setInterval(scanner('rowPoller', async () => {
     const day = daily.kuwaitDay();
     const r = room(day);
+
+    /*
+     * F2 · STOP HIT, on the 2 s pass and BEFORE the room gate — the bid
+     * printing through a stop is the one thing that must not wait for a
+     * browser to be open, nor for the 60 s snapshot. One query over the armed
+     * stops; a hit is marked once on the leg, alerted once to the room (if
+     * any), sent to the phone regardless, and the contracts/board re-snapshot.
+     */
+    const sh = await require('./services/stopHit').check(day)
+      .catch((e) => { log.warn(`[stopHit] not checked: ${e.message}`); return null; });
+    if (sh && sh.hits.length) {
+      for (const h of sh.hits) {
+        const a = require('./services/stopHit').alertFor(h);
+        io.to(r).emit('spread:alert', a);
+        log.warn(`[stopHit] ${h.symbol} C${h.seq}: bid ${h.bidFils} through the ${h.stopFils} stop`);
+        // The phone carries it too, like a resume: a stop hit the operator
+        // does not hear about is the loss this check exists to prevent.
+        whatsapp.send(`${a.title}. ${a.body}`).then((wr) => {
+          if (!wr.ok) log.warn(`[stopHit] WhatsApp not delivered for ${h.symbol}: ${wr.reason || `${wr.failed} failed`}`);
+        });
+      }
+      require('./lib/events').changed(['contracts', 'board', 'account'], `stop hit ${sh.hits.map((h) => h.symbol).join(',')}`);
+    }
+
     if (!io.sockets.adapter.rooms.get(r)) return 'idle';
 
     try {

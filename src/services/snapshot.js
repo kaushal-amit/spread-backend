@@ -85,6 +85,13 @@ async function snapshot(day, budgetKd, { parts = PARTS, final = false, reason = 
     partial: wanted.length !== PARTS.length, parts: wanted, final: !!final, reason,
   };
   wanted.forEach((name, i) => { out[name] = built[i]; });
+  // F7 · the fits line rides on the budget section when both the board and
+  // the budget computed in this snapshot: the TAKE cards against free_kd.
+  // A partial that carries one without the other leaves the previous line
+  // standing on the client (it is a field of the budget section).
+  if (out.board && out.budget && !out.board.error && !out.budget.error && Array.isArray(out.board.take)) {
+    out.budget.fits = require('../api/sizing').fits(out.board.take, out.budget.free_kd);
+  }
   return out;
 }
 

@@ -548,11 +548,22 @@ function build() {
     // R-22 · the stop, one fil below the nearest aged shelf. The entry it
     // protects is the open position's entry, else the suggested/touch entry so
     // WATCH shows where the stop would sit before the buy.
-    const stopEntry = contract && contract.entry != null ? Number(contract.entry)
-      : (hit && hit.bidFils != null ? Number(hit.bidFils) : (book && book.bid ? Number(book.bid) : null));
-    const stop = stopEntry != null
-      ? await depth.stopFor(sym, d, stopEntry, { now: new Date() }).catch((e) => ({ error: e.message, stopFils: null }))
-      : { stopFils: null, reason: 'no entry price to place a stop under yet' };
+    // F2 · once a position is open the stop is the one RECORDED at the fill
+    // (contract.stopFils) — fixed, never re-derived from a later ladder. The
+    // live computation is only the WATCH preview of where it would sit.
+    let stop;
+    if (contract && contract.state !== 'picked') {
+      stop = contract.stopFils != null
+        ? { symbol: sym, stopFils: contract.stopFils, fixedAtFill: true, hitAt: contract.stopHitAt,
+            reason: contract.stopHitAt ? 'set at the fill — the bid has printed through it: HIT THE BID' : 'set at the fill from the aged shelf — fixed; moving it is how the large losses happened' }
+        : { symbol: sym, stopFils: null, fixedAtFill: true, hitAt: null,
+            reason: 'no stop: no bid shelf had aged when this filled — nothing real to stop under' };
+    } else {
+      const stopEntry = hit && hit.bidFils != null ? Number(hit.bidFils) : (book && book.bid ? Number(book.bid) : null);
+      stop = stopEntry != null
+        ? { ...(await depth.stopFor(sym, d, stopEntry, { now: new Date() }).catch((e) => ({ error: e.message, stopFils: null }))), fixedAtFill: false }
+        : { stopFils: null, fixedAtFill: false, reason: 'no entry price to place a stop under yet' };
+    }
     // Today's closed contracts for the symbol — the DONE state needs the P&L.
     const bySeq = new Map();
     for (const l of legsRows) {
@@ -573,9 +584,19 @@ function build() {
           shares: bought, netKd: Number((gross - fees).toFixed(3)), feesKd: Number(fees.toFixed(3)) });
       }
     }
+    const candidate = hit ? present.stockCandidate(hit, bkd) : null;
+    // F6 · the hold facts, assembled from what this bundle already carries
+    // (contract, ladder markers, sizing basis, the card's metrics, kb
+    // thresholds). Pure; a threshold read that fails leaves the defaults.
+    const holdFacts = require('./holdFacts').holdFacts({
+      contract, book, sizing: sizing && !sizing.error ? sizing : null, candidate,
+      thresholds: await require('./sizing').thresholds().catch(() => ({})),
+      yourShares: sizing && !sizing.error ? (sizing.suggested_shares ?? null) : null,
+    });
     res.json({
       symbol: sym, tradingDay: d, budgetKd: bkd,
-      candidate: hit ? present.stockCandidate(hit, bkd) : null,
+      candidate,
+      holdFacts,
       orderBook: book,
       sizing, fillTime: fill, depthSignal: depthSig,
       lastMove,
@@ -595,6 +616,14 @@ function build() {
         postedAt: l.posted_at ? new Date(l.posted_at).toISOString() : null,
         resolvedAt: l.resolved_at ? new Date(l.resolved_at).toISOString() : null,
         note: l.note || '', exitVenue: l.exit_venue || null,
+        // F1 · the queued rest of a partial fill; F2 · the stop fixed at the
+        // fill; F3/F4 · taken anyway. All from the row — nothing derived here.
+        restStatus: l.rest_status || null,
+        restingShares: l.status === 'POSTED' ? Number(l.shares)
+          : l.rest_status === 'POSTED' ? Number(l.shares) - Number(l.filled_shares || 0) : 0,
+        stopFils: l.stop_fils == null ? null : Number(l.stop_fils),
+        stopHitAt: l.stop_hit_at ? new Date(l.stop_hit_at).toISOString() : null,
+        isOverride: !!l.is_override, overrideReason: l.override_reason || null,
       })),
       closedToday: closed,
       session: require('../socket').sessionPhase(),
