@@ -173,10 +173,10 @@ const stubBoard = (cards) => {
     const det = await get(`/stocks/${A}/detail?date=${DAY}`);
     chk('  the detail stop is the recorded one, fixed at the fill', det.stop && det.stop.stopFils === 199 && det.stop.fixedAtFill === true, det.stop);
     // F6 · the hold facts ride on the bundle: the mark from the contract, the
-    // protection from the ladder, the exit depth from the offer (30,000 vs 7,500 = 4×).
-    chk('  holdFacts: mark, bid protected, exit ok — from what the bundle already carries', det.holdFacts && det.holdFacts.mark.computed && det.holdFacts.mark.bidFils === 200
+    // protection from the ladder, the exit depth from the offer (30,000 vs 7,500 = 4× — over 3×, a warning).
+    chk('  holdFacts: mark, bid protected, exit depth — from what the bundle already carries', det.holdFacts && det.holdFacts.mark.computed && det.holdFacts.mark.bidFils === 200
       && det.holdFacts.bidProtected.computed && det.holdFacts.bidProtected.protectedNow === true
-      && det.holdFacts.exitOk.computed && det.holdFacts.exitOk.ok === true && det.holdFacts.refill.computed === false, det.holdFacts);
+      && det.holdFacts.exitOk.computed && det.holdFacts.exitOk.ok === false && det.holdFacts.exitOk.multiple === 4 && det.holdFacts.refill.computed === false, det.holdFacts);
     let sh = await stopHit.check(DAY);
     chk('bid 200 above the stop: no hit', sh.hits.length === 0, sh);
     await fx.quote(A, { day: DAY, at: new Date(Date.now() + 1000).toISOString(), last: 199, bid: 199, offer: 200 });
@@ -263,20 +263,24 @@ const stubBoard = (cards) => {
 
     console.log('\n=== F5 · Trading at Last ===');
     const at = (hhmm) => new Date(`${DAY}T${String(Math.floor(hhmm / 100) - 3).padStart(2, '0')}:${String(hhmm % 100).padStart(2, '0')}:00Z`);
-    const p1305 = session.sessionPhase(at(1305)), p1315 = session.sessionPhase(at(1315)), p1330 = session.sessionPhase(at(1330)), p1100 = session.sessionPhase(at(1100));
+    const p1305 = session.sessionPhase(at(1305)), p1312 = session.sessionPhase(at(1312)), p1315 = session.sessionPhase(at(1315)), p1100 = session.sessionPhase(at(1100));
     chk('13:05 is closed (the auction), TAL named in the note', p1305.phase === 'closed' && !p1305.canClose && /Trading at Last/.test(p1305.note), p1305);
-    chk('13:15 is tal: not open, canClose', p1315.phase === 'tal' && p1315.open === false && p1315.canClose === true && p1315.tal === true, p1315);
-    chk('13:30 is over', p1330.phase === 'closed' && !p1330.tal && !p1330.canClose, p1330);
+    chk('13:12 is tal: not open, canClose', p1312.phase === 'tal' && p1312.open === false && p1312.canClose === true && p1312.tal === true, p1312);
+    chk('13:15 (Close-Of-Day) is over — not a closing venue', p1315.phase === 'closed' && !p1315.tal && !p1315.canClose, p1315);
     chk('11:00 is open and canClose', p1100.open && p1100.canClose && !p1100.tal, p1100);
-    chk('the presenter passes tal and canClose through', require('../src/api/present').sessionInfo(p1315, 0).phase === 'tal' && require('../src/api/present').sessionInfo(p1315, 0).canClose === true);
+    chk('the presenter passes tal and canClose through', require('../src/api/present').sessionInfo(p1312, 0).phase === 'tal' && require('../src/api/present').sessionInfo(p1312, 0).canClose === true);
     // A position in B again, then the clock moves to TAL (past the flat-by).
     const bBuy2 = await post('/trading/record', { symbol: B, side: 'BUY', status: 'FILLED', priceFils: 200, shares: inside });
     chk('B is long again', bBuy2.status === 200, bBuy2.body);
-    process.env.SPREAD_TEST_NOW = `${DAY}T10:15:00Z`; // 13:15 Kuwait
+    process.env.SPREAD_TEST_NOW = `${DAY}T10:12:00Z`; // 13:12 Kuwait
     socket.sessionPhase = () => ({ open: false, canClose: false, tal: false, phase: 'closed', clocks: session.get() });
     const closedHit = await post('/trading/hit-bid', { symbol: B });
     chk('closed (not TAL): refused', closedHit.status === 409 && /closed/.test(closedHit.body.error), closedHit.body);
     socket.sessionPhase = () => ({ open: false, canClose: true, tal: true, phase: 'tal', clocks: session.get() });
+    // A Close-Of-Day print is NOT read: with only that captured there is nothing to close at.
+    await fx.quote(B, { day: DAY, at: new Date(Date.now() + 1500).toISOString(), session: 'Close-Of-Day', last: 196, bid: 195, offer: 197 });
+    const codOnly = await post('/trading/hit-bid', { symbol: B });
+    chk('with only a Close-Of-Day print, TAL has nothing to close at (404, not a price from the wrong label)', codOnly.status === 404 && /Trading-at-Last print/.test(codOnly.body.error), codOnly.body);
     await fx.quote(B, { day: DAY, at: new Date(Date.now() + 2000).toISOString(), session: 'Trading at Last', last: 198, bid: 197, offer: 199 });
     const talHit = await post('/trading/hit-bid', { symbol: B });
     chk('in TAL the close is at the auction price (last 198), venue AUCTION, past the flat-by', talHit.status === 200 && talHit.body.venue === 'AUCTION' && /at 198/.test(talHit.body.note), talHit.body);

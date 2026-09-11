@@ -27,10 +27,10 @@ chk('EXIT AT: the targets, break-even and the recorded stop', f.exitAt.computed 
 chk('VOLUME: the spike ratio', f.volume.computed && f.volume.ratio === 1.42 && /1\.42×/.test(f.volume.note), f.volume);
 chk('CEILING: the marked wall with its presence', f.ceiling.computed && f.ceiling.priceFils === 255 && f.ceiling.qty === 400000 && /96%/.test(f.ceiling.note), f.ceiling);
 chk('REFILL: not measured, said', f.refill.computed === false && /not measured/.test(f.refill.reason), f.refill);
-chk('EXIT OK: 12,000 offer = 4× your 3,000 ≥ 3× — you are not the level', f.exitOk.computed && f.exitOk.multiple === 4 && f.exitOk.ok === true, f.exitOk);
+chk('EXIT OK: 12,000 offer = 4× your 3,000 — over 3×, you queue behind it', f.exitOk.computed && f.exitOk.multiple === 4 && f.exitOk.ok === false && /queue behind/.test(f.exitOk.note), f.exitOk);
 
 const thin = holdFacts({ contract, book: { ...book, offers: [{ price: 251, qty: 4000, markers: [] }] }, sizing: null, candidate: null, thresholds: t, yourShares: 3000 });
-chk('EXIT OK: 4,000 offer = 1.3× your 3,000 — under 3×, your offer would be the level', thin.exitOk.computed && thin.exitOk.ok === false && /would be the level/.test(thin.exitOk.note), thin.exitOk);
+chk('EXIT OK: 4,000 offer = 1.3× your 3,000 — under 3×, clears', thin.exitOk.computed && thin.exitOk.ok === true && /clears/.test(thin.exitOk.note), thin.exitOk);
 chk('VOLUME with no card: not computed, with the reason', thin.volume.computed === false && /no card/.test(thin.volume.reason), thin.volume);
 chk('CEILING with no marked wall: computed, none', thin.ceiling.computed && thin.ceiling.priceFils === null && /no offer wall/.test(thin.ceiling.note), thin.ceiling);
 
@@ -56,6 +56,8 @@ const e = fits([card('MRC', 900)], 720);
 chk('nothing fits: the deficit is named', e.line === 'Free 720 — nothing fits, MRC needs 180 more', e);
 chk('no take cards: nothing to fit', fits([], 720).line === 'Free 720 — nothing to fit');
 chk('free unknown: said', fits([card('MRC', 300)], null).line === 'free KD not known');
+const m = fits([card('MRC', 300), card('KHOT', 400)], 720, { minPositionKd: 333 });
+chk('the minimum position applies: MRC needs 333 not 300, so KHOT (400) is short by 13', m.items[0].needKd === 333 && m.items[0].fits === true && m.items[1].fits === false && m.items[1].deficitKd === 13, m);
 
 console.log(`\n${p === n ? 'ALL PASS' : 'FAILURES: ' + (n - p)}  (${n} checks)`);
 process.exit(p === n ? 0 : 1);

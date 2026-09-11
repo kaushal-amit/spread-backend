@@ -346,9 +346,12 @@ async function stopFor(symbol, tradingDay, entryFils, { db = pool, now = null } 
  *              stepping in front of the established queue ({n} = the price undercut)
  *     SHELF    a round-number offer level
  *
- * The flow-delta labels (PLACED, PULLED, RELOCATED, PARKED, THIN) are seeded in
- * kb_phrase but not emitted here yet — they need per-order change tracking
- * across captures, a separate piece.
+ * F8 · the flow-delta labels (PLACED, PULLED, TRADED, RELOCATED, PARKED,
+ * WALKDOWN) are decided in services/ladderFlow.js over the capture history and
+ * the session's volume BRACKET (spread.v_quote), and the whole-book banners
+ * (DOUBLE WALL from the scraper's symbol_minute.is_frozen, CLOSING BID — an
+ * observation — from the previous session's closing bid) ride on `banners`.
+ * THIN is not a marker — the exit depth is sizing's warning (KB gate 12).
  *
  * ageMins walks back while a price stays continuously present (same rule as
  * bookAges); presencePct counts every capture the price appears in.
@@ -399,6 +402,23 @@ async function ladder(symbol, tradingDay, { db = pool, now = null } = {}) {
   const isRound = (price) => roundFils > 0 && price % roundFils === 0;
   const fmt = (q) => Number(q).toLocaleString('en-US');
 
+  // F8 · the session's cumulative volume series, for the flow markers. A
+  // failure here leaves the series empty: the flow markers are then simply
+  // not computed (never guessed), the age markers still render.
+  const flow = require('./ladderFlow');
+  const { rows: volRows } = await db.query(
+    `SELECT created_at AS at, volume FROM spread.v_quote
+      WHERE symbol = upper($1) AND trading_date = $2::date AND volume IS NOT NULL
+      ORDER BY created_at;`, [sym, tradingDay]).catch(() => ({ rows: [] }));
+  const volumes = volRows.map((r) => ({ at: new Date(r.at), volume: Number(r.volume) }));
+  const fm = flow.flowMarkers(captures, volumes, t);
+  const parked = flow.parkedBids(captures, t);
+  const walkdown = flow.walkdownSteps(captures, volumes, t);
+  // A marker may name a phrase KEY other than its event (PLACED while trading
+  // reads PLACED_TRADING); the event stays the machine-readable one.
+  const flowMarks = (side, price) => ((side === 'bid' ? fm.bids : fm.offers).get(price) || [])
+    .map((m) => (m.key ? { event: m.event, text: P.render(m.key, { n: m.n, p: m.p }) } : P.marker(m.event, { n: m.n, p: m.p })));
+
   const bids = [...latest.bid.entries()].map(([price, qty]) => ({ price, qty }))
     .sort((a, b) => b.price - a.price)
     .map((row, i) => {
@@ -410,6 +430,8 @@ async function ladder(symbol, tradingDay, { db = pool, now = null } = {}) {
       if (aged) markers.push(P.marker('AGED', { n: ageMins }));
       if (i === 0 && row.qty < noProtQty) markers.push(P.marker('NOPROT', { n: fmt(row.qty) }));
       if (isRound(row.price)) markers.push(aged ? P.marker('CATCH') : P.marker('SHELF'));
+      if (parked.has(row.price)) markers.push(P.marker('PARKED', { n: parked.get(row.price) }));
+      markers.push(...flowMarks('bid', row.price));
       return { price: row.price, qty: row.qty, ageMins, aged, bait, markers };
     });
 
@@ -425,9 +447,55 @@ async function ladder(symbol, tradingDay, { db = pool, now = null } = {}) {
       if (agedAbove) markers.push(P.marker('UNDERCUT', { n: agedAbove.price }));
     }
     if (isRound(row.price)) markers.push(P.marker('SHELF'));
+    if (i === 0 && walkdown) markers.push(P.marker('WALKDOWN', { n: walkdown }));
+    markers.push(...flowMarks('offer', row.price));
     return { price: row.price, qty: row.qty, ageMins: row.ageMins, aged, presencePct: row.presencePct, markers };
   });
 
-  return { symbol: sym, capturedAt: new Date(latest.at).toISOString(), captures: totalCaps, bids, offers };
+  // F8 · the whole-book banners.
+  const banners = [];
+  // DOUBLE WALL · the scraper's own verdict (writeSymbolMinute: both touches
+  // big and volume_delta 0), never re-derived here — and only when its LAST
+  // rows are all frozen and the newest is within two minutes of this capture:
+  // one 30 s tick, or a row from an hour ago (the symbol dropped from the
+  // slots), is not "nothing trading".
+  const { rows: smRows } = await db.query(
+    `SELECT is_frozen, bid_qty, offer_qty, ts FROM public.symbol_minute
+      WHERE symbol = upper($1) AND trading_date = $2::date
+      ORDER BY ts DESC LIMIT 3;`, [sym, tradingDay]).catch(() => ({ rows: [] }));
+  if (smRows.length >= 2 && smRows.every((r) => r.is_frozen === true)
+      && Math.abs(latest.at.getTime() - new Date(smRows[0].ts).getTime()) <= 120000) {
+    banners.push({ type: 'DOUBLE WALL', text: `both sides walled — ${fmt(smRows[0].bid_qty)} bid, ${fmt(smRows[0].offer_qty)} offered, nothing trading` });
+  }
+  // CLOSING BID (an observation) · the immediately preceding session's closing
+  // touch bid — a capture after hard_exit (12:30) on the last day with captures,
+  // within a week — against today's first capture. Two queries: the day first
+  // (an equality is pushed below v_depth's DISTINCT; `<` is not — 038), then
+  // that day's last touch.
+  const { rows: [pd] } = await db.query(
+    `SELECT max(trading_date) AS day FROM spread.v_depth
+      WHERE symbol = upper($1) AND trading_date < $2::date AND trading_date >= $2::date - interval '7 days';`,
+    [sym, tradingDay]).catch(() => ({ rows: [] }));
+  if (pd && pd.day) {
+    const prevDay = require('../lib/day').toDay(pd.day);
+    const { rows: [pc] } = await db.query(
+      `SELECT bid::numeric AS price, bid_qty::bigint AS qty, captured_at
+         FROM spread.v_depth
+        WHERE symbol = upper($1) AND trading_date = $2::date AND level = 1 AND bid IS NOT NULL
+        ORDER BY captured_at DESC LIMIT 1;`, [sym, prevDay]).catch(() => ({ rows: [] }));
+    const sess = require('../lib/session');
+    if (pc && sess.kuwait(pc.captured_at).mins >= sess.get().hardExitAt) {
+      const first = captures[0];
+      const cb = flow.closingBid({ price: Number(pc.price), qty: Number(pc.qty), at: pc.captured_at, day: prevDay },
+        { bid: first.bid, at: first.at }, flow.volumeAt(volumes, first.at), t);
+      if (cb) banners.push(cb);
+    }
+  }
+
+  return { symbol: sym, capturedAt: new Date(latest.at).toISOString(), captures: totalCaps, bids, offers,
+    banners, flowNotes: fm.notes,
+    // The traded-volume bracket between the last two captures: {min, max}, or
+    // null when unknown (no reading on both sides) — then no flow marker was claimed.
+    traded: fm.traded, volumeDelta: fm.traded ? fm.traded.max : null };
 }
 

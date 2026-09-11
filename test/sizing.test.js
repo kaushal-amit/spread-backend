@@ -107,8 +107,13 @@ const DAY = toDay(new Date(Date.now() + SESSION.timezoneOffsetHours * 3600000));
     console.log('\n=== floor and ceiling ===');
     chk('floor is at least min_position_kd',
         s1.body.floor_kd >= 333, s1.body.floor_kd);
-    chk('ceiling respects the exit-depth rule',
-        s1.body.ceiling_kd <= (90000 / 3 * 200) / 1000 + 0.01, s1.body.ceiling_kd);
+    // KB gate 12 (fixed 11 Sep): the exit depth is a WARNING, never a ceiling.
+    // The ceiling is the queue share or the free allocation, whichever is less;
+    // with ~16 KD free here there is no size, so the exit depth is not computed.
+    chk('the ceiling is the queue share or free, whichever is less — the offer no longer caps it',
+        Math.abs(s1.body.ceiling_kd - Math.min((100000 * 0.30 * 200) / 1000, s1.body.basis.free_kd)) < 0.01, { ceiling: s1.body.ceiling_kd, free: s1.body.basis.free_kd });
+    chk('  with no size, the exit depth is NOT COMPUTED, not a false pass',
+        s1.body.exit_depth && s1.body.exit_depth.computed === false && s1.body.exit_depth.ok === null && (s1.body.warnings || []).length === 0, s1.body.exit_depth);
     chk('your_pct is a share of the BID, not of the budget',
         s1.body.your_pct === null || s1.body.your_pct <= 30.01, s1.body.your_pct);
 
@@ -147,12 +152,35 @@ const DAY = toDay(new Date(Date.now() + SESSION.timezoneOffsetHours * 3600000));
     await setBudget(700); await gateStore.load();
     const at700 = await get('/sizing/SZTEST');
     await setBudget(2000); await gateStore.load();
+    // A 30,000 touch: floor 333 (5% of it is 300), ceiling = min(queue share
+    // 1,800, free ~796) — a reachable size, so the exit depth below is measured
+    // against real shares. The offer is 3,000: under the OLD rule (offer / 3 as
+    // a ceiling) the band would have been capped at 200 KD — under the floor,
+    // unreachable. That it is reachable at all is the proof the cap is gone.
+    await fx.depthLevel('SZTEST', { bid: 200, bidQty: 30000, offer: 201, offerQty: 3000 });
     const at2000 = await get('/sizing/SZTEST');
     chk('PUT session-budget 2000 → /sizing sizes from 2,000, not 700',
         at2000.status === 200 && at2000.body.basis.budget_kd === 2000 && at700.body.basis.budget_kd === 700,
         { b2000: at2000.body?.basis?.budget_kd, b700: at700.body?.basis?.budget_kd });
     chk('  and more capital → a larger free base', at2000.body.basis.free_kd > at700.body.basis.free_kd,
         { f2000: at2000.body?.basis?.free_kd, f700: at700.body?.basis?.free_kd });
+    // KB gate 12 at a real size: a 3,000 offer against ~3,980 shares is 0.75× —
+    // under 3× — the exit clears (ok true, no warning), the band is untouched
+    // (ceiling = queue share 1,800 KD or free, whichever is less) and the size
+    // is suggested — under the old rule this symbol was UNREACHABLE.
+    chk('  a thin offer no longer caps the band: reachable, exit ok, ceiling = queue share or free',
+        at2000.body.reachable === true && at2000.body.suggested_shares > 0
+        && at2000.body.exit_depth?.computed === true && at2000.body.exit_depth.ok === true && at2000.body.exit_depth.multiple < 3
+        && (at2000.body.warnings || []).length === 0
+        && Math.abs(at2000.body.ceiling_kd - Math.min((30000 * 0.30 * 200) / 1000, at2000.body.basis.free_kd)) < 0.01
+        && at2000.body.ceiling_kd > (3000 / 3 * 200) / 1000,
+        { reachable: at2000.body.reachable, exit: at2000.body.exit_depth, warnings: at2000.body.warnings, ceiling: at2000.body.ceiling_kd, free: at2000.body.basis?.free_kd });
+    // And a thick offer WARNS instead of capping: 90,000 against the same size is ~22×.
+    await fx.depthLevel('SZTEST', { bid: 200, bidQty: 30000, offer: 201, offerQty: 90000 });
+    const thick = await get('/sizing/SZTEST');
+    chk('  a thick offer warns at ~22× and the band is the same',
+        thick.body.exit_depth?.ok === false && thick.body.exit_depth.multiple > 3 && /queue behind it/.test((thick.body.warnings || []).join(' '))
+        && Math.abs(thick.body.ceiling_kd - at2000.body.ceiling_kd) < 0.01, { exit: thick.body.exit_depth, warnings: thick.body.warnings, ceiling: thick.body.ceiling_kd });
     // No budget row at all → 503 NOT_READY, never a number. A gate_config version
     // with no session-budget is the "operator never set one" state.
     await pool.query(

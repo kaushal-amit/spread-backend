@@ -76,9 +76,9 @@ function holdFacts({ contract, book, sizing, candidate, thresholds = {}, yourSha
   // REFILL · not measured: needs per-level change tracking across captures.
   const refill = nc('not measured — the bid-rebuild count needs per-level change tracking (F8)');
 
-  // EXIT OK · the touch offer's size against your size. The sizing rule
-  // (sizing.js, exit_depth_max_x): the offer must be at least that many times
-  // your size, or your offer IS the level and the exit is you against you.
+  // EXIT OK · KB gate 12: the offer at the touch should be NO MORE than
+  // exit_depth_max_x times your size — a bigger offer means you queue behind
+  // it to get out ("100,000 at your exit means you do not get out", FLOW 7).
   const maxX = Number(thresholds.exit_depth_max_x ?? 3);
   const offerQty = book?.offers?.length ? Number(book.offers[0].qty) : (sizing?.basis?.offer_qty ?? null);
   const exitOk = shares == null || !shares
@@ -86,8 +86,8 @@ function holdFacts({ contract, book, sizing, candidate, thresholds = {}, yourSha
     : offerQty == null
       ? nc('no offer depth captured')
       : { computed: true, offerQty: Number(offerQty), yourShares: shares, multiple: Number((Number(offerQty) / shares).toFixed(2)),
-          thresholdX: maxX, ok: Number(offerQty) / shares >= maxX,
-          note: `offer ${fmt(offerQty)} = ${(Number(offerQty) / shares).toFixed(1)}× your ${fmt(shares)}${Number(offerQty) / shares >= maxX ? ' — you are not the level' : ` — under ${maxX}×, your offer would be the level`}` };
+          thresholdX: maxX, ok: Number(offerQty) / shares <= maxX,
+          note: `offer ${fmt(offerQty)} = ${(Number(offerQty) / shares).toFixed(1)}× your ${fmt(shares)}${Number(offerQty) / shares <= maxX ? ' — clears' : ` — over ${maxX}×, you queue behind it`}` };
 
   return { mark, bidProtected, exitAt, volume, ceiling, refill, exitOk };
 }

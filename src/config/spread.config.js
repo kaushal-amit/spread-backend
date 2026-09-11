@@ -21,9 +21,11 @@ const SESSION = {
   openAt: '09:00',
   closeAt: '13:00',
   auctionCloseAt: '13:25',
-  // F5 · Trading at Last — closing at the auction price only (confirmed 11 Sep).
+  // F5 · Trading at Last — 13:10–13:14, the exchange's 'Trading at Last'
+  // label alone (confirmed 11 Sep): closing at the auction price only.
+  // Close-Of-Day (13:15–13:25) is NOT a closing venue for us.
   talStartAt: '13:10',
-  talEndAt: '13:30',
+  talEndAt: '13:15',
   timezoneOffsetHours: 3,          // Kuwait, UTC+3
   // Before this hour the session that matters is still yesterday's. Work done
   // in the evening straddles a calendar roll that has nothing to do with the

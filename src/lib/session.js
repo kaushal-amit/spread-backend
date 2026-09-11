@@ -36,11 +36,12 @@ const DEFAULTS = {
   openAt: hhmmToMins(SESSION.openAt),               // 09:00
   closeAt: hhmmToMins(SESSION.closeAt),             // 13:00 · continuous trading ends → canOpen false
   auctionCloseAt: hhmmToMins(SESSION.auctionCloseAt), // 13:25
-  // F5 · Trading at Last: 13:10–13:30, trades at the closing-auction price only.
-  // No new position; an OPEN position may still be closed (canClose) — the last
-  // honest exit of the day, not "into the auction".
+  // F5 · Trading at Last: 13:10–13:14 (the exchange's TAL label alone), trades
+  // at the closing-auction price only. No new position; an OPEN position may
+  // still be closed (canClose) — the last honest exit of the day, not "into
+  // the auction". Close-Of-Day (13:15–13:25) is not a closing venue for us.
   talStartAt: hhmmToMins(SESSION.talStartAt),       // 13:10
-  talEndAt: hhmmToMins(SESSION.talEndAt),           // 13:30
+  talEndAt: hhmmToMins(SESSION.talEndAt),           // 13:15
   dataWindowEndAt: 13 * 60 + 30,                    // 13:30 · captures after this are a stuck script
   stepDownAt: hhmmToMins(EXIT.stepDownAtClock),     // 11:00
   lateSessionAt: 12 * 60,                           // 12:00
@@ -87,7 +88,7 @@ function kuwait(now = new Date()) {
  * The phase. `open` = a new position may be opened as far as the CLOCK is
  * concerned (Sun–Thu, 09:00 ≤ t < 13:00; the stops and the calendar have
  * their own say). `canClose` = an open position may be CLOSED now: while open,
- * and during Trading at Last (13:10–13:30, at the auction price only — F5).
+ * and during Trading at Last (13:10–13:14, at the auction price only — F5).
  * `tal` is that window. `dataWindow` = a capture now is a live capture (t < 13:30).
  */
 function sessionPhase(now = new Date()) {

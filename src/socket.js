@@ -262,24 +262,52 @@ async function view(day, budgetKd) {
    * other is a silent `undefined` rather than an error.
    */
   const present = require('./api/present');
+  /*
+   * F11 · the wake-up pace on the card. live.wakeUpScan is the same query the
+   * 09:30–12:00 scanner fires (trades so far against the symbol's own median
+   * by this hour); read once per snapshot and stamped on every card whose
+   * symbol it flags, so the TODAY card and the chip can say "12×" without a
+   * second source. null = the scan could not run (said on the board as
+   * `wakeups: null`), never a quiet absence of badges.
+   */
+  // Only within the scanner's own window (09:30–12:00, today): outside it the
+  // pace would be the whole day against the noon median — a number, not a
+  // wake-up. Then `wakeups` is null and no card carries a badge.
+  let wakeList = null;
+  const nowK = require('./lib/session').kuwait();
+  const inWindow = day === daily.kuwaitDay() && nowK.mins >= 9 * 60 + 30 && nowK.mins < 12 * 60;
+  if (inWindow) {
+    try { wakeList = await require('./services/live').wakeUpScan(day); }
+    catch (e) { log.warn('[socket] wake-up scan not computed:', e.message); }
+  }
+  const wakeBy = new Map((wakeList || []).map((w) => [w.symbol, w]));
+  const card = (x) => {
+    const c = present.stockCandidate(x, budgetKd);
+    const w = wakeBy.get(c.symbol);
+    c.wakeup = w ? { paceRatio: w.paceRatio, tradesSoFar: w.tradesSoFar, baseline: w.baseline, measuredAt: w.measuredAt, lowConfidence: !!w.lowConfidence, why: w.why } : null;
+    return c;
+  };
   return {
     tradingDay: day, budgetKd,
     // null when the board computed; { code, error } when it did not. A client
     // that sees this must not render the empty buckets as a quiet market.
     error: boardError,
+    // F11 · the symbols waking up right now (pace ≥ the wake ratio), or null
+    // when the scan could not run or it is outside the 09:30–12:00 window.
+    wakeups: wakeList ? wakeList.map((w) => ({ symbol: w.symbol, paceRatio: w.paceRatio, lowConfidence: !!w.lowConfidence })) : null,
     // CR-8 · the four verdict buckets + NOT COMPUTED; the three old names ride
     // along for one release (recommended = take, nearMiss = oneAway,
     // rejected = priceWarn + leave). Nothing is removed: the buckets sum to
     // counts.universe or the screen threw UNIVERSE_MISMATCH and `error` says so.
-    take: (screen.take || []).map((x) => present.stockCandidate(x, budgetKd)),
-    oneAway: (screen.oneAway || []).map((x) => present.stockCandidate(x, budgetKd)),
-    priceWarn: (screen.priceWarn || []).map((x) => present.stockCandidate(x, budgetKd)),
-    leave: (screen.leave || []).map((x) => present.stockCandidate(x, budgetKd)),
-    recommended: (screen.recommended || []).map((x) => present.stockCandidate(x, budgetKd)),
-    nearMiss: (screen.nearMiss || []).map((x) => present.stockCandidate(x, budgetKd)),
-    rejected: (screen.rejected || []).map((x) => present.stockCandidate(x, budgetKd)),
+    take: (screen.take || []).map(card),
+    oneAway: (screen.oneAway || []).map(card),
+    priceWarn: (screen.priceWarn || []).map(card),
+    leave: (screen.leave || []).map(card),
+    recommended: (screen.recommended || []).map(card),
+    nearMiss: (screen.nearMiss || []).map(card),
+    rejected: (screen.rejected || []).map(card),
     // SPR-38 · NOT COMPUTED is its own bucket, never folded into rejected.
-    notComputed: (screen.notComputed || []).map((x) => present.stockCandidate(x, budgetKd)),
+    notComputed: (screen.notComputed || []).map(card),
     counts: screen.counts,
     reach: screen.reach,
     session: sessionPhase(),

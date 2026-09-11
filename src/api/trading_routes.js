@@ -100,7 +100,7 @@ async function assertPostable({ symbol, day, priceFils, shares, override, overri
       facts.refusals.push(`${kd.toFixed(0)} KD is under the ${Number(facts.floorKd).toFixed(0)} KD floor — under the minimum share of the aged bid, invisible in the queue`);
     }
     if (facts.ceilingKd != null && kd > facts.ceilingKd + 0.001) {
-      facts.refusals.push(`${kd.toFixed(0)} KD is over the ${Number(facts.ceilingKd).toFixed(0)} KD ceiling (you would be the level, or the exit depth cannot absorb it, or it exceeds free)`);
+      facts.refusals.push(`${kd.toFixed(0)} KD is over the ${Number(facts.ceilingKd).toFixed(0)} KD ceiling (you would be the level, or it exceeds free)`);
     }
   }
   if (facts.refusals.length && !override) {
@@ -149,8 +149,8 @@ async function assertPostable({ symbol, day, priceFils, shares, override, overri
  *   continuous trading   at the bid, venue MARKET — unless past the flat-by
  *                        clock (R-08: you should be flat, not trading into
  *                        the closing auction)
- *   Trading at Last      13:10–13:30, at the closing-auction price (the last
- *                        print), venue AUCTION. The flat-by rule does not
+ *   Trading at Last      13:10–13:14, at the closing-auction price (the last
+ *                        TAL print), venue AUCTION. The flat-by rule does not
  *                        apply: this IS the last honest exit of the day, at
  *                        one known price, not "into the auction".
  *   otherwise            refused — outside the session the latest quote is
@@ -167,14 +167,13 @@ async function closeVenue(day, symbol, { db = pool } = {}) {
     const stops = await require('../services/stops').evaluate(day, { db }).catch(() => null);
     if (stops && stops.pastFlatBy) {
       throw refused(`past ${stops.flatBy} — you should be flat, not trading into the auction`,
-        `the flat-by rule (FLOW step 7): a sell after this window records into the pre-close auction, where a 30 August exit filled 11 fils away. Trading at Last (${phase.clocks?.talStartClock || '13:10'}–${phase.clocks?.talEndClock || '13:30'}) closes at the auction price`);
+        `the flat-by rule (FLOW step 7): a sell after this window records into the pre-close auction, where a 30 August exit filled 11 fils away. Trading at Last (${phase.clocks?.talStartClock || '13:10'}–${phase.clocks?.talEndClock || '13:15'}) closes at the auction price`);
     }
   }
   if (tal) {
-    // The auction price is the last executable print AFTER continuous
-    // trading (session 'Trading at Last' / 'Close-Of-Day'), never the 12:59 bid.
+    // The auction price is the last 'Trading at Last' print, never the 12:59 bid.
     const cp = await positions.latestClosePrint(symbol, day, db);
-    if (!cp?.last_price) throw notFound(`no Trading-at-Last print for ${symbol} yet — nothing to close at`, 'the auction price is the last TAL / Close-Of-Day print; none has been captured for this symbol today');
+    if (!cp?.last_price) throw notFound(`no Trading-at-Last print for ${symbol} yet — nothing to close at`, 'the auction price is the last Trading-at-Last print; none has been captured for this symbol today');
     return { tal: true, priceFils: Number(cp.last_price), exitVenue: 'AUCTION', quote: cp };
   }
   const q = await positions.latestQuote(symbol, day, db);

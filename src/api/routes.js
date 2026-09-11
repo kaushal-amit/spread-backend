@@ -507,6 +507,11 @@ function build() {
         for (const lvl of book.bids) { const m = bm.get(Number(lvl.price)); if (m) { lvl.markers = m.markers; lvl.ageMins = m.ageMins; lvl.aged = m.aged; } }
         for (const lvl of book.offers) { const m = om.get(Number(lvl.price)); if (m) { lvl.markers = m.markers; lvl.ageMins = m.ageMins; lvl.presencePct = m.presencePct; } }
         book.laddersCapturedAt = marks.capturedAt;
+        // F8 · the whole-book banners and the flow notes (levels that vanished).
+        book.banners = marks.banners || [];
+        book.flowNotes = marks.flowNotes || [];
+        book.volumeDelta = marks.volumeDelta ?? null;
+        book.traded = marks.traded ?? null;
       } catch { /* markers are additive — the book renders without them */ }
       return book;
   }

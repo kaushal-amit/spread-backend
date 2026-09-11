@@ -60,6 +60,15 @@ const fakeSocket = (id, focus = null) => {
     chk('  fits names the free KD and a line', snap.budget.fits && snap.budget.fits.freeKd === bud.free_kd && typeof snap.budget.fits.line === 'string' && Array.isArray(snap.budget.fits.items), snap.budget.fits);
     chk('contracts section = GET /trading/contracts', Array.isArray(snap.contracts) && snap.contracts.length === con.length);
     chk('board section carries the CR-8 buckets and stops', snap.board && Array.isArray(snap.board.take) && 'stops' in snap.board, snap.board && Object.keys(snap.board));
+    // F11 · the wake-up pace rides on the board: `wakeups` (a list, or null
+    // when the scan could not run) and `wakeup` on every card (null = not flagged).
+    const allCards = [...snap.board.take, ...snap.board.oneAway, ...snap.board.priceWarn, ...snap.board.leave, ...snap.board.notComputed];
+    chk('  wakeups is a list or null, and every card carries wakeup', 'wakeups' in snap.board && (snap.board.wakeups === null || Array.isArray(snap.board.wakeups))
+      && allCards.length > 0 && allCards.every((c) => 'wakeup' in c && (c.wakeup === null || typeof c.wakeup.paceRatio === 'number')), { wakeups: snap.board.wakeups, sample: allCards[0] && allCards[0].wakeup });
+    // The scan runs only 09:30–12:00 Kuwait on today's day: this suite runs on
+    // a fixture day, so the board says null — not a quiet absence of badges.
+    chk('  on a day that is not today, wakeups is null (outside the scan window)', snap.board.wakeups === null, snap.board.wakeups);
+    chk('  the REST presenter carries wakeup: null too (never undefined on one path)', 'wakeup' in require('../src/api/present').stockCandidate({ symbol: 'X', gates: [], failed: [], notComputed: [], passed: false, reachable: true }, 790), 'wakeup' in require('../src/api/present').stockCandidate({ symbol: 'X', gates: [], failed: [], notComputed: [], passed: false, reachable: true }, 790));
     chk('slots section says NOT_READY when the scraper is not configured — an error, never a silent []',
         snap.slots && snap.slots.error && snap.slots.error.code === 'NOT_READY', snap.slots);
     const part = await snapshotSvc.snapshot(DAY, 790, { parts: ['account', 'budget'], reason: 'trade' });

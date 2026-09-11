@@ -35,6 +35,12 @@ const DEFAULTS = {
   SHELF: 'round number — stops sit here',
   NOPROT: '{n} — nothing beneath',
   CATCH: 'catch bid — price chosen',
+  // F8 · the flow markers (042 seeds the rows; these are the fallbacks).
+  // PLACED_TRADING is the PLACED label when something may have traded: the
+  // growth is still placed size, but "nothing traded" cannot be said.
+  PLACED_TRADING: '+{n} while up to {p} traded',
+  TRADED: '{n} traded',
+  WALKDOWN: 'walk-down, step {n}',
 };
 
 let cache = null; // event -> text (still_true only), or null until loaded

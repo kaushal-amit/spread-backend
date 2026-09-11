@@ -90,7 +90,7 @@ async function snapshot(day, budgetKd, { parts = PARTS, final = false, reason = 
   // A partial that carries one without the other leaves the previous line
   // standing on the client (it is a field of the budget section).
   if (out.board && out.budget && !out.board.error && !out.budget.error && Array.isArray(out.board.take)) {
-    out.budget.fits = require('../api/sizing').fits(out.board.take, out.budget.free_kd);
+    out.budget.fits = require('../api/sizing').fits(out.board.take, out.budget.free_kd, { minPositionKd: out.budget.min_position_kd ?? null });
   }
   return out;
 }

@@ -136,10 +136,10 @@ async function latestQuote(symbol, day, db = pool) {
 }
 
 /**
- * F5 · the latest executable print AFTER continuous trading — Trading at Last
- * / Close-Of-Day rows (spread.v_quote carries them; v_quote_screening does
- * not). This is the auction price a position closes at in TAL. null = no
- * such print today yet.
+ * F5 · the latest 'Trading at Last' print (spread.v_quote carries it;
+ * v_quote_screening does not). This is the auction price a position closes
+ * at in TAL. Close-Of-Day rows are not read — that label is not a closing
+ * venue for us (confirmed 11 Sep). null = no TAL print today yet.
  */
 async function latestClosePrint(symbol, day, db = pool) {
   const { rows: [q] } = await db.query(
@@ -147,7 +147,7 @@ async function latestClosePrint(symbol, day, db = pool) {
             session, created_at
        FROM spread.v_quote
       WHERE symbol = $1 AND trading_date = $2
-        AND session IN ('Trading at Last', 'Close-Of-Day')
+        AND session = 'Trading at Last'
       ORDER BY created_at DESC LIMIT 1;`, [symbol, day]);
   return q || null;
 }

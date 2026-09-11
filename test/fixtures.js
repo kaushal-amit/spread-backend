@@ -127,6 +127,14 @@ function bind(pool) {
          row.buySellRatio ?? null, row.coveragePct ?? null, row.dayRange ?? null, row.chgFils ?? null]);
     },
     /** spread.symbol_day_stats — the bridge row the gates read (016/018). */
+    /** public.symbol_minute — the scraper's derived touch row; F8 reads is_frozen for DOUBLE WALL. */
+    symbolMinute: (sym, { day, at, isFrozen = false, bidQty = null, offerQty = null }) => {
+      assertTestSymbol(sym);
+      return pool.query(
+        `INSERT INTO public.symbol_minute (symbol, ts, trading_date, bid_qty, offer_qty, is_frozen, source)
+         VALUES ($1, $2, $3::date, $4, $5, $6, 'BACKFILL') ON CONFLICT DO NOTHING`, [sym, at, day, bidQty, offerQty, isFrozen]);
+    },
+    clearSymbolMinute: (sym) => { assertTestSymbol(sym); return pool.query('DELETE FROM public.symbol_minute WHERE symbol = $1', [sym]); },
     symbolDayStats: (sym, day, s = {}) => {
       assertTestSymbol(sym); assertTestDay(day);
       return pool.query(

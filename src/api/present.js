@@ -275,6 +275,10 @@ function stockCandidate(r, budgetKd) {
     // the board was built without them (a review board, a fixture) — the chip
     // then matches nothing rather than everything.
     everTraded: typeof r.everTraded === 'boolean' ? r.everTraded : null,
+    // F11 · the wake-up pace: null here on every path; socket.view() stamps the
+    // scan's reading on the snapshot's cards — never undefined on one path and
+    // null on the other.
+    wakeup: null,
     bookCapturedToday: typeof r.bookCapturedToday === 'boolean' ? r.bookCapturedToday : null,
     // C-01 · a gate that failed for want of a NUMBER, named. The screen must
     // render these differently from a stock that is bad — for weeks they were
@@ -327,6 +331,14 @@ function orderBook(row, ladder = [], prev = null) {
     // a guess, so the screen can show "not captured" instead of a wrong band.
     limitBand: { low: 0, high: 0 },
     lastTickTime: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+    // F8 · whole-book banners (DOUBLE WALL / PHANTOM) and the flow notes,
+    // filled by routes.orderBookFor from depth.ladder. Empty by default.
+    banners: [],
+    flowNotes: [],
+    // The traded-volume bracket {min, max} between the last two captures, and
+    // its max as volumeDelta; null = unknown, no flow marker was claimed.
+    traded: null,
+    volumeDelta: null,
   };
 }
 

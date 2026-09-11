@@ -196,14 +196,36 @@ const symbol = String(symbolIn || '').toUpperCase();
   const floorKd = bidQty === null ? t.min_position_kd
     : Math.max(t.min_position_kd, kdOf(bidQty * t.my_pct_min / 100));
   const byQueue = kdOf(bidQty === null ? null : bidQty * t.my_pct_max / 100);
-  const byExit = kdOf(offerQty === null ? null : offerQty / t.exit_depth_max_x);
-  const ceilingRaw = [byQueue, byExit, free].filter((v) => v !== null && Number.isFinite(v));
+  /*
+   * THE EXIT-DEPTH RULE IS A WARNING, NOT A CEILING (fixed 11 Sep).
+   *
+   * KB gate 12 / kb row exit_depth_max_x ('offer_qty as a multiple of your
+   * size', max 3): the offer at your exit should be NO MORE than 3× your size —
+   * a bigger offer means you queue behind it to get out. This used to be read
+   * the other way round and applied as a ceiling (shares ≤ offer / 3), which
+   * shrank the band on every thin offer and let a thick one through. The
+   * ceiling is now the queue share and the free allocation; the exit depth is
+   * measured against the suggested size and reported below (`exit_depth`,
+   * `warnings`). A warn-gate never removes (SPREAD_knowledge_base §4).
+   */
+  const ceilingRaw = [byQueue, free].filter((v) => v !== null && Number.isFinite(v));
   const ceilingKd = ceilingRaw.length ? Math.min(...ceilingRaw) : free;
 
   const reachable = reasons.length === 0 && ceilingKd >= floorKd && free >= t.min_position_kd;
   const suggested = reachable ? Math.min(ceilingKd, free) : null;
   const shares = (suggested !== null && price)
     ? Math.floor((suggested * 1000) / price) : null;
+
+  const warnings = [];
+  const exitMultiple = (shares && offerQty != null) ? Number((offerQty / shares).toFixed(2)) : null;
+  const exitDepth = {
+    offer_qty: offerQty, your_shares: shares, multiple: exitMultiple, max_x: t.exit_depth_max_x,
+    computed: exitMultiple !== null,
+    ok: exitMultiple === null ? null : exitMultiple <= t.exit_depth_max_x,
+  };
+  if (exitDepth.ok === false) {
+    warnings.push(`the offer at the touch is ${exitMultiple}× your ${shares.toLocaleString('en-US')} — over ${t.exit_depth_max_x}×, you queue behind it to get out`);
+  }
 
   return ({
     symbol,
@@ -217,6 +239,9 @@ const symbol = String(symbolIn || '').toUpperCase();
     net_per_fil_kd: (shares !== null) ? Number((shares / 1000).toFixed(3)) : null,
     reachable,
     reasons,
+    // KB gate 12 · the exit depth, measured, as a WARNING (never a band bound).
+    exit_depth: exitDepth,
+    warnings,
     // Shown so a wrong figure is traceable to its inputs.
     basis: {
       free_kd: Number(free.toFixed(3)),
@@ -279,9 +304,10 @@ async function budgetView() {
  * symbol's min_budget_kd from stats:daily); a card whose minimum is not
  * computed is listed as such, never assumed to fit. Greedy, like the
  * reference: the first card takes its share, the next sees what is left.
- * Pure — the snapshot calls it with the presented take list and free_kd.
+ * Pure — the snapshot calls it with the presented take list, free_kd and
+ * min_position_kd (the floor sizing applies: a card needs at least that).
  */
-function fits(takeCards, freeKd) {
+function fits(takeCards, freeKd, { minPositionKd = null } = {}) {
   const free = freeKd == null ? null : Number(freeKd);
   if (free == null) return { freeKd: null, items: [], line: 'free KD not known' };
   let remaining = free;
@@ -289,7 +315,9 @@ function fits(takeCards, freeKd) {
   for (const c of takeCards || []) {
     const need = c?.headroom?.minKd;
     if (need == null) { items.push({ symbol: c.symbol, needKd: null, computed: false, fits: null, deficitKd: null }); continue; }
-    const n = Number(need);
+    // The floor sizing applies: max(min_position_kd, the card's 5 % of the bid)
+    // — a card is never said to fit at less than the minimum position.
+    const n = Math.max(Number(need), minPositionKd == null ? 0 : Number(minPositionKd));
     if (remaining >= n) { items.push({ symbol: c.symbol, needKd: n, computed: true, fits: true, deficitKd: 0 }); remaining -= n; }
     else { items.push({ symbol: c.symbol, needKd: n, computed: true, fits: false, deficitKd: Number((n - remaining).toFixed(3)) }); remaining = 0; }
   }
@@ -320,7 +348,9 @@ function build() {
    *          flat commission bites, and below my_pct_min you are invisible in
    *          the queue.
    * ceiling  the largest that can still get out: above my_pct_max you ARE the
-   *          level, and the offer must be exit_depth_max_x times your size.
+   *          level; and never more than the free allocation.
+   * exit_depth  KB gate 12, a warning: the offer at the touch should be no more
+   *          than exit_depth_max_x times your size, or you queue behind it.
    */
   r.get('/sizing/:symbol', wrap(async (req, res) => res.json(await sizingFor(require('./params').symbolParam(req.params.symbol)))));
 
