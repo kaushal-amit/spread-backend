@@ -80,6 +80,15 @@ app.use((req, res, next) => {
 // A shared secret on every write. Reads stay open when no token is configured,
 // so localhost is unchanged; set SPREAD_API_TOKEN before a public hostname.
 app.use('/api', require('./api/auth').middleware);
+// D3 · every write says WHO: the service token or the signed-in uid. One line
+// per write, so the audit of a trade names the operator, not just the token.
+app.use('/api', (req, _res, next) => {
+  if (req.method !== 'GET' && req.method !== 'OPTIONS' && req.method !== 'HEAD') {
+    const a = req.auth || {};
+    log.info(`[audit] ${req.method} ${req.path} by ${a.kind || 'unknown'}${a.uid ? ' ' + (a.email || a.uid) : ''}`);
+  }
+  next();
+});
 app.use('/api', require('./api/routes').build());
 
 /**

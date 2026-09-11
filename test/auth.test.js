@@ -75,9 +75,100 @@ const call = (srv, method, headers = {}) =>
     lines.length = 0;
     delete require.cache[require.resolve('../src/api/auth')];
     process.env.SPREAD_API_TOKEN = 'x'.repeat(24);
+    const D3 = { FIREBASE_PROJECT_ID: 'jk-test', SPREAD_ALLOWED_UIDS: 'uid-amit' };
     chk('production · 24 characters is the floor and boots',
-        require('../src/api/auth').assertProductionConfig({ env: { NODE_ENV: 'production', CORS_ORIGIN: 'https://t' }, log: fake }) === true, lines);
+        require('../src/api/auth').assertProductionConfig({ env: { NODE_ENV: 'production', CORS_ORIGIN: 'https://t', ...D3 }, log: fake }) === true, lines);
+    lines.length = 0;
+    chk('production · no FIREBASE_PROJECT_ID refuses to start, naming it',
+        require('../src/api/auth').assertProductionConfig({ env: { NODE_ENV: 'production', CORS_ORIGIN: 'https://t', SPREAD_ALLOWED_UIDS: 'u' }, log: fake }) === false
+        && /FIREBASE_PROJECT_ID/.test(lines.join('\n')), lines);
+    lines.length = 0;
+    chk('production · an empty SPREAD_ALLOWED_UIDS refuses to start, naming it',
+        require('../src/api/auth').assertProductionConfig({ env: { NODE_ENV: 'production', CORS_ORIGIN: 'https://t', FIREBASE_PROJECT_ID: 'x' }, log: fake }) === false
+        && /SPREAD_ALLOWED_UIDS/.test(lines.join('\n')), lines);
     delete process.env.SPREAD_API_TOKEN;
+  }
+
+  // ── D3 · a sign-in (Firebase ID token) beside the service token ──
+  console.log('\n=== D3 · service token OR a signed-in, allowlisted user ===');
+  {
+    delete require.cache[require.resolve('../src/api/auth')];
+    process.env.SPREAD_API_TOKEN = 'service-token-of-24-chars!';
+    process.env.SPREAD_ALLOWED_UIDS = 'uid-amit, uid-spare';
+    const auth = require('../src/api/auth');
+    const nowS = () => Math.floor(Date.now() / 1000);
+    // The verifier is injected: no network, no Google keys. A "token" is
+    // a.b.c where b names the outcome.
+    let verifies = 0;
+    auth.setVerifier({ verify: async (t) => {
+      verifies++;
+      const [, kind] = String(t).split('.');
+      if (kind === 'expired') { const e = new Error('expired'); e.code = 'TOKEN_EXPIRED'; throw e; }
+      if (kind === 'garbage') { const e = new Error('bad'); e.code = 'BAD_TOKEN'; throw e; }
+      if (kind === 'stranger') return { uid: 'uid-stranger', email: 'x@y.z', exp: nowS() + 3600 };
+      if (kind === 'short') return { uid: 'uid-amit', email: 'amit@x', exp: nowS() + 1 };
+      return { uid: 'uid-amit', email: 'amit@x', exp: nowS() + 3600 };
+    } });
+    const code = (p) => p.then(() => null, (e) => e.code);
+    chk('the service token → service', (await auth.authenticate('service-token-of-24-chars!')).kind === 'service');
+    chk('  from a remote address too (server-to-server, any address)', (await auth.authenticate('service-token-of-24-chars!', { local: false })).kind === 'service');
+    const u = await auth.authenticate('h.ok.s');
+    chk('a valid ID token with a listed uid → user, with uid/email/exp', u.kind === 'user' && u.uid === 'uid-amit' && u.email === 'amit@x' && u.exp > nowS(), u);
+    await auth.authenticate('h.ok.s');
+    chk('  the same token is verified ONCE (cached until exp)', verifies === 1, verifies);
+    chk('an unlisted uid → UID_NOT_ALLOWED', await code(auth.authenticate('h.stranger.s')) === 'UID_NOT_ALLOWED');
+    chk('  and it is a 403, not a 401', await auth.authenticate('h.stranger.s').catch((e) => e.status) === 403);
+    chk('an expired token → TOKEN_EXPIRED', await code(auth.authenticate('h.expired.s')) === 'TOKEN_EXPIRED');
+    chk('garbage → BAD_TOKEN', await code(auth.authenticate('h.garbage.s')) === 'BAD_TOKEN');
+    chk('a non-JWT string that is not the service token → BAD_TOKEN without asking the verifier',
+        await code(auth.authenticate('not-a-jwt')) === 'BAD_TOKEN' && verifies === 5, verifies);
+    chk('nothing → NO_TOKEN', await code(auth.authenticate(null)) === 'NO_TOKEN');
+    // the cache honours exp: a 1-second token verifies again after it lapses
+    verifies = 0;
+    await auth.authenticate('h.short.s');
+    await new Promise((r) => setTimeout(r, 1200));
+    await auth.authenticate('h.short.s').catch(() => {});
+    chk('a cached token is re-verified once its exp has passed', verifies === 2, verifies);
+
+    // over HTTP: the codes reach the body as `reason`
+    const app = express();
+    app.use('/api', auth.middleware);
+    app.get('/api/read', (q, r) => r.json({ auth: q.auth }));
+    const srv2 = http.createServer(app);
+    await new Promise((r) => srv2.listen(0, r));
+    const get = (h) => fetch(`http://127.0.0.1:${srv2.address().port}/api/read`, { headers: { 'x-forwarded-for': '203.0.113.9', ...h } }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    const ok = await get({ authorization: 'Bearer h.ok.s' });
+    chk('HTTP · a signed-in user passes and req.auth names the uid', ok.status === 200 && ok.body.auth.kind === 'user' && ok.body.auth.uid === 'uid-amit', ok);
+    const st = await get({ authorization: 'Bearer h.stranger.s' });
+    chk('HTTP · a stranger gets 403 FORBIDDEN / reason UID_NOT_ALLOWED with the email in the sentence',
+        st.status === 403 && st.body.code === 'FORBIDDEN' && st.body.reason === 'UID_NOT_ALLOWED' && /x@y\.z/.test(st.body.error), st);
+    const ex = await get({ authorization: 'Bearer h.expired.s' });
+    chk('HTTP · expired → 401 with reason TOKEN_EXPIRED (the SPA refreshes and retries once)', ex.status === 401 && ex.body.reason === 'TOKEN_EXPIRED', ex);
+    const svc = await get({ authorization: 'Bearer service-token-of-24-chars!' });
+    chk('HTTP · the service token still passes, as service', svc.status === 200 && svc.body.auth.kind === 'service', svc);
+    srv2.close();
+
+    // the socket: a user socket is disconnected at exp with spread:reauth first
+    const fakeSocket = (token) => {
+      const s = { handshake: { auth: { token }, address: '203.0.113.9', headers: {} }, data: {}, emitted: [], disconnected: false, handlers: {},
+        emit: (ev, arg) => s.emitted.push([ev, arg]), disconnect: () => { s.disconnected = true; (s.handlers.disconnect || []).forEach((h) => h()); },
+        on: (ev, h) => { (s.handlers[ev] ||= []).push(h); } };
+      return s;
+    };
+    const sShort = fakeSocket('h.short.s');
+    const nextErr = await new Promise((r) => auth.socketMiddleware(sShort, r));
+    chk('socket · a signed-in user connects and socket.data.auth names the uid', !nextErr && sShort.data.auth.uid === 'uid-amit', nextErr && nextErr.message);
+    await new Promise((r) => setTimeout(r, 1300));
+    chk('socket · at exp the server emits spread:reauth and disconnects',
+        sShort.disconnected && sShort.emitted.some(([ev, a]) => ev === 'spread:reauth' && a.reason === 'TOKEN_EXPIRED'), sShort.emitted);
+    const sSvc = fakeSocket('service-token-of-24-chars!');
+    const e2 = await new Promise((r) => auth.socketMiddleware(sSvc, r));
+    chk('socket · a service socket connects with no exp timer', !e2 && sSvc.data.auth.kind === 'service');
+    const sBad = fakeSocket('h.stranger.s');
+    const e3 = await new Promise((r) => auth.socketMiddleware(sBad, r));
+    chk('socket · a stranger is refused with FORBIDDEN / UID_NOT_ALLOWED', e3 && e3.data.code === 'FORBIDDEN' && e3.data.reason === 'UID_NOT_ALLOWED', e3 && e3.data);
+    auth.setVerifier(null);
+    delete process.env.SPREAD_API_TOKEN; delete process.env.SPREAD_ALLOWED_UIDS;
   }
 
   // ── with a token: READS need it too (Phase 3) — the account is the sensitive surface ──

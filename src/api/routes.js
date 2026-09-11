@@ -928,6 +928,35 @@ function build() {
     res.json({ settings });
   }));
 
+  /*
+   * ─── D3 · the depth slots, proxied ────────────────────────────────────────
+   * The browser used to call the scraper's /ingest directly, which put the
+   * scraper's INGEST_TOKEN in the public bundle. Now the SPA (signed in) asks
+   * the backend, and the backend — the scraper's only remote caller — presents
+   * the token from its own env (services/scraperClient, SCRAPER_INGEST_URL).
+   * The scraper's answer is relayed VERBATIM: its 409 sentences ("One symbol,
+   * one slot…", "slot 2 holds an open position") are what the tiles show.
+   */
+  r.get('/slots', wrap(async (_req, res) => {
+    const sc = require('../services/scraperClient');
+    if (!sc.configured) throw notReady('the scraper is not configured on this backend', 'set SCRAPER_INGEST_URL (and INGEST_TOKEN)');
+    const list = await sc.depthSymbols();
+    if (!list) throw notReady('the scraper did not answer /depth-symbols', sc.BASE);
+    res.json(list);
+  }));
+  r.post('/slots/:n', wrap(async (req, res) => {
+    const sc = require('../services/scraperClient');
+    if (!sc.configured) throw notReady('the scraper is not configured on this backend', 'set SCRAPER_INGEST_URL (and INGEST_TOKEN)');
+    const n = intParam(req.params.n, { name: 'slot', min: 1, max: 99 });
+    const symbol = symbolParam(req.body?.symbol);
+    const reason = String(req.body?.reason || 'UI').slice(0, 200);
+    const replacedSymbol = req.body?.replaced_symbol ? symbolParam(req.body.replaced_symbol) : null;
+    log.info(`[slots] ${req.auth?.kind || '?'}${req.auth?.uid ? ':' + req.auth.uid : ''} → slot ${n} = ${symbol} (${reason})`);
+    const out = await sc.applySlot(n, { symbol, reason, replacedSymbol });
+    if (out.networkError) throw notReady('the scraper is not reachable for a slot swap', out.reason);
+    res.status(out.status || (out.ok ? 200 : 502)).json(out.body ?? { ok: out.ok });
+  }));
+
   r.get('/candles/:symbol', wrap(async (req, res) => {
     res.json(await history.candles(symbolParam(req.params.symbol), {
       day: dayParam(req.query.date, null),

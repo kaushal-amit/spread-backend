@@ -92,50 +92,141 @@ function isLoopback(req) {
 
 let warned = false;
 
+/*
+ * ─── D3 · TWO CREDENTIALS, ONE DECISION ──────────────────────────────────────
+ *
+ * The static SPREAD_API_TOKEN used to be compiled into the public terminal
+ * bundle — anyone who loaded the site once held it. Now:
+ *
+ *   service   the static token, presented by the scraper, the scripts, the
+ *             cron jobs. Accepted from ANY address (it is no longer in a
+ *             browser), compared constant-time, first because it is cheap.
+ *   user      a Firebase ID token from the SPA (Google sign-in). Verified by
+ *             lib/firebaseAuth (Admin SDK, local signature check), then the
+ *             uid must be in SPREAD_ALLOWED_UIDS. Cached by token hash until
+ *             its exp so a 10-second poll does not re-verify the same JWT.
+ *
+ * The refusal names its reason — NO_TOKEN, BAD_TOKEN, TOKEN_EXPIRED,
+ * UID_NOT_ALLOWED, NOT_CONFIGURED — because the SPA acts on it: expired →
+ * refresh and retry once; not allowed → show the sentence and a sign-out.
+ * A signed-in stranger is logged with the email: the loud form of "someone
+ * who is not you signed in".
+ */
+const ALLOWED_UIDS = new Set(String(process.env.SPREAD_ALLOWED_UIDS || '')
+  .split(',').map((x) => x.trim()).filter(Boolean));
+let verifier = null;                 // injectable: tests pass { verify }
+const setVerifier = (v) => { verifier = v; verified.clear(); };
+const getVerifier = () => verifier || require('../lib/firebaseAuth');
+const verified = new Map();          // sha256(token) -> { uid, email, exp }
+const VERIFIED_MAX = 100;
+
+class AuthRefused extends Error {
+  constructor(code, message, status = 401) { super(message); this.code = code; this.status = status; }
+}
+
+/**
+ * → { kind: 'service' } | { kind: 'user', uid, email, exp }
+ * throws AuthRefused(code)
+ */
+async function authenticate(presented, { local = false } = {}) {
+  // No service token configured: loopback passes as before (development),
+  // whatever it presents; anything else is refused naming the variable.
+  if (!TOKEN && local) return { kind: 'local' };
+  if (!presented) {
+    throw new AuthRefused('NO_TOKEN', TOKEN
+      ? 'this endpoint requires a sign-in or a service token'
+      : 'the API requires a token when the request is not local');
+  }
+  if (tokenMatches(presented)) return { kind: 'service' };
+  // Not the service token → it must be a sign-in. A short opaque string is
+  // never a JWT; refuse it as BAD_TOKEN without asking the verifier.
+  if (typeof presented !== 'string' || presented.split('.').length !== 3) {
+    throw new AuthRefused('BAD_TOKEN', 'the token is neither the service token nor a sign-in token');
+  }
+  const key = crypto.createHash('sha256').update(presented).digest('hex');
+  const hit = verified.get(key);
+  const nowS = Math.floor(Date.now() / 1000);
+  if (hit && hit.exp > nowS) return { kind: 'user', ...hit };
+  if (hit) verified.delete(key);
+  let d;
+  try { d = await getVerifier().verify(presented); }
+  catch (e) {
+    if (e?.code === 'NOT_CONFIGURED') throw new AuthRefused('NOT_CONFIGURED', e.message);
+    throw new AuthRefused(e?.code === 'TOKEN_EXPIRED' ? 'TOKEN_EXPIRED' : 'BAD_TOKEN', e.message || 'the sign-in token is not valid');
+  }
+  if (!ALLOWED_UIDS.has(d.uid)) {
+    log.warn('[auth] sign-in refused: uid not in SPREAD_ALLOWED_UIDS', { uid: d.uid, email: d.email });
+    throw new AuthRefused('UID_NOT_ALLOWED', `${d.email || d.uid} is signed in but not allowed on this terminal`, 403);
+  }
+  const user = { uid: d.uid, email: d.email || null, exp: d.exp };
+  if (verified.size >= VERIFIED_MAX) verified.delete(verified.keys().next().value);
+  verified.set(key, user);
+  return { kind: 'user', ...user };
+}
+
 function middleware(req, res, next) {
   if (OPEN_PATHS.has(req.path)) return next();
   if (req.method === 'OPTIONS') return next();
 
-  if (!TOKEN) {
-    if (isLoopback(req)) {
-      // Once, not per request: a warning on every call is a warning nobody
-      // reads.
-      if (!warned) {
-        warned = true;
-        log.warn('[auth] SPREAD_API_TOKEN is not set. The API answers loopback only. '
-          + 'Set it before this service has a public hostname.');
-      }
-      return next();
+  const local = isLoopback(req);
+  if (!TOKEN && local) {
+    // Once, not per request: a warning on every call is a warning nobody
+    // reads.
+    if (!warned) {
+      warned = true;
+      log.warn('[auth] SPREAD_API_TOKEN is not set. The API answers loopback only. '
+        + 'Set it before this service has a public hostname.');
     }
-
-    const e = unauthorised('the API requires a token when the request is not local');
-    return res.status(e.status).json({
-      error: e.message,
-      code: e.code,
-      detail: 'SPREAD_API_TOKEN is not configured on this server, so the API is '
-        + 'restricted to 127.0.0.1. Set it and send Authorization: Bearer <token>.',
-    });
+    req.auth = { kind: 'local' };
+    return next();
   }
-  if (tokenMatches(bearer(req))) return next();
-
-  const e = unauthorised('this endpoint requires a token');
-  res.status(e.status).json({ error: e.message, code: e.code,
-    detail: 'set SPREAD_API_TOKEN in the backend and send it as Authorization: Bearer <token>' });
+  authenticate(bearer(req), { local }).then((a) => { req.auth = a; next(); }).catch((e) => {
+    const status = e instanceof AuthRefused ? e.status : 401;
+    const code = e instanceof AuthRefused ? e.code : 'UNAUTHORISED';
+    res.status(status).json({
+      error: e.message, code: status === 401 ? 'UNAUTHORISED' : 'FORBIDDEN', reason: code,
+      detail: !TOKEN
+        ? 'SPREAD_API_TOKEN is not configured on this server, so the API is restricted to 127.0.0.1. Set it and send Authorization: Bearer <token>.'
+        : code === 'NOT_CONFIGURED' ? 'set FIREBASE_PROJECT_ID (and SPREAD_ALLOWED_UIDS) on the backend to accept sign-ins'
+        : code === 'UID_NOT_ALLOWED' ? 'add the uid to SPREAD_ALLOWED_UIDS on the backend'
+        : code === 'TOKEN_EXPIRED' ? 'refresh the sign-in token and retry'
+        : 'sign in on the terminal, or send the service token as Authorization: Bearer <token>',
+    });
+  });
 }
 
 /**
  * Socket.IO handshake. The token travels in `auth: { token }` on connect (the
- * socket.io-client option), or the connection must be from loopback.
+ * socket.io-client option — a FUNCTION on the client, so a reconnect presents
+ * a fresh ID token), or the connection must be from loopback.
+ *
+ * A socket authenticated with an ID token is DISCONNECTED at the token's exp
+ * (a 09:00 socket must not stay authorised all day after a sign-out): the
+ * server emits `spread:reauth` then disconnects; the client reconnects with
+ * a fresh token and re-watches. A service socket has no exp and lives on.
  */
 function socketMiddleware(socket, next) {
   const presented = socket.handshake?.auth?.token || socket.handshake?.headers?.['x-spread-token'] || null;
   const addr = socket.handshake?.address || '';
   const fwd = socket.handshake?.headers?.['x-forwarded-for'];
   const local = !BEHIND_PROXY && !fwd && (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
-  if (TOKEN ? tokenMatches(presented) : local) return next();
-  const e = new Error(TOKEN ? 'socket requires a token' : 'socket answers loopback only until SPREAD_API_TOKEN is set');
-  e.data = { code: 'UNAUTHORISED' };
-  return next(e);
+  authenticate(presented, { local }).then((a) => {
+    socket.data = socket.data || {};
+    socket.data.auth = a;
+    if (a.kind === 'user' && a.exp) {
+      const ms = Math.max(0, a.exp * 1000 - Date.now());
+      const t = setTimeout(() => {
+        socket.emit('spread:reauth', { reason: 'TOKEN_EXPIRED', at: new Date().toISOString() });
+        socket.disconnect(true);
+      }, ms);
+      socket.on('disconnect', () => clearTimeout(t));
+    }
+    next();
+  }).catch((err) => {
+    const e = new Error(TOKEN ? err.message : 'socket answers loopback only until SPREAD_API_TOKEN is set');
+    e.data = { code: err instanceof AuthRefused && err.status === 403 ? 'FORBIDDEN' : 'UNAUTHORISED', reason: err.code || 'NO_TOKEN' };
+    next(e);
+  });
 }
 
 /**
@@ -152,6 +243,11 @@ function assertProductionConfig({ env = process.env, log: out = log } = {}) {
       + 'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"');
   }
   if (!origin || origin === '*') problems.push('CORS_ORIGIN is unset or "*" — set it to the terminal origin');
+  // D3 · the terminal signs in; without a project id no sign-in verifies and
+  // without an allowlist no signed-in user is allowed. Both are needed for the
+  // SPA to reach the API at all in production — refuse rather than serve 401s.
+  if (!env.FIREBASE_PROJECT_ID) problems.push('FIREBASE_PROJECT_ID is not set — the terminal\'s sign-in cannot be verified');
+  if (!String(env.SPREAD_ALLOWED_UIDS || '').trim()) problems.push('SPREAD_ALLOWED_UIDS is empty — no signed-in user is allowed');
   if (prod && problems.length) {
     out.error('[auth] refusing to start in production:\n  ' + problems.join('\n  ')
       + '\n  see .env.example, "PRODUCTION"');
@@ -167,4 +263,5 @@ function assertProductionConfig({ env = process.env, log: out = log } = {}) {
 function warnIfOpen(out = log) { return assertProductionConfig({ log: out }); }
 
 module.exports = { middleware, socketMiddleware, warnIfOpen, assertProductionConfig,
-  tokenMatches, hasToken: () => !!TOKEN, MIN_TOKEN_LENGTH, isLoopback };
+  tokenMatches, hasToken: () => !!TOKEN, MIN_TOKEN_LENGTH, isLoopback,
+  authenticate, setVerifier, AuthRefused, allowedUids: () => new Set(ALLOWED_UIDS) };
