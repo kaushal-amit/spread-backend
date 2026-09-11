@@ -181,6 +181,8 @@ const timers = []; // interval handles, cleared on shutdown
     const th = await require('./config/thresholds').load();
     log.info(`[boot] kb_threshold: ${Object.keys(th).length} numbers loaded`);
 
+    const clocks = await require('./lib/session').load();
+    log.info(`[boot] session clocks: step-down ${clocks.stepDownAt / 60 | 0}:${String(clocks.stepDownAt % 60).padStart(2, '0')}, hard exit ${clocks.hardExitAt / 60 | 0}:${String(clocks.hardExitAt % 60).padStart(2, '0')}, flat by ${clocks.flatByAt / 60 | 0}:${String(clocks.flatByAt % 60).padStart(2, '0')} (${clocks.loadedFrom})`);
     const g = await require('./services/gateStore').load();
     log.info(`[boot] gate config version ${g.version}` +
                 (Object.keys(g.overrides).length ? ` (${Object.keys(g.overrides).length} overrides)` : ' (defaults)'));
@@ -233,6 +235,11 @@ const timers = []; // interval handles, cleared on shutdown
     // for today and the historical backfill run in the background inside start().
     timers.push(startDailyStatsScheduler({ guard: scanner }));
     timers.push(startM45Scheduler({ guard: scanner }));
+    // 1 Oct 2026 · the band ceiling must be re-derived when the settlement fee
+    // goes. Checked at boot and then daily: a WARN and a data_alarm until a
+    // band-ceiling value is saved on/after the date.
+    timers.push(require('./jobs/schedule').startCeilingCheck({ guard: scanner,
+      current: () => require('./services/gateStore').effective().GATES.ceilingCommissionKd }));
   } catch (e) {
     log.error('[boot] failed:', e.message);
     process.exit(1);

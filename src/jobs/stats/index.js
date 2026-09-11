@@ -199,6 +199,16 @@ async function computeRange(from, to, opts) {
  * session opens. Best-effort: a reconcile failure must not fail the stats.
  */
 async function runDaily(day, { db = pool, apply = true, budgetKd, cfg } = {}) {
+  // An empty SESSION day is a capture defect and fails loudly; a holiday is
+  // the scheduler's skip (lib/calendar), never reached here. Without this a
+  // day with no quotes wrote a green 0-row run and the board screened on it.
+  const { rows: [q] } = await db.query(
+    'SELECT count(*)::int AS n FROM public.awsat_market_quotes WHERE trading_date = $1::date;', [day]);
+  if (!q.n) {
+    const cal = await require('../../lib/calendar').sessionDay(day, db);
+    if (!cal.session) return { day, rows: 0, minMinutes: 0, maxMinutes: 0, skipped: cal.reason, reconcileFees: null };
+    throw new Error(`stats: ${day} has no quotes but the calendar says it was a session — a capture defect, not an empty day; refusing a 0-row run`);
+  }
   const stats = await computeDay(day, { db, budgetKd, cfg });
   let reconcileFees = null;
   try { reconcileFees = await require('../reconcile-fees').reconcile(day, { apply, db }); }

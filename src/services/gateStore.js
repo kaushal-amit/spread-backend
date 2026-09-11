@@ -44,6 +44,11 @@ const BINDING = {
    * capture, and turning one on changes which stocks are even in band.
    */
   'g8-flow':          ['GATES', 'distFlowRatio'],
+  // The band ceiling — the most commission a trade can carry. Rests on the
+  // 3.4 KD pre-October round trip and MUST be re-derived on 1 Oct 2026 when
+  // the settlement fee goes (services/ceiling.js nags until it is). A
+  // saved value here is what "re-derived" means.
+  'band-ceiling':     ['GATES', 'ceilingCommissionKd'],
   'target-1tick':     ['TARGETS', 'allow1Tick'],
   'target-2ticks':    ['TARGETS', 'allow2Ticks'],
   'target-3ticks':    ['TARGETS', 'allow3Ticks'],

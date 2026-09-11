@@ -165,7 +165,11 @@ function sessionStops(closed, now, t) {
  * from earlier or another symbol never decides the current phase; with no
  * recent reading the phase is NULL and the engine evaluates as before.
  */
-const TRADING_DAY_END_MINS = 13 * 60 + 30;
+// The two clocks, from ONE source (lib/session): continuous trading ends at
+// closeAt (13:00) — no new position after it; the DATA window runs to
+// dataWindowEndAt (13:30) — a capture after that is a stuck script.
+const sessionClock = require('../lib/session');
+const TRADING_DAY_END_MINS = sessionClock.DEFAULTS.dataWindowEndAt; // kept for callers; the close rule below reads the live clocks
 
 async function marketPhase(day, now, db = pool) {
   const { rows: [r] } = await db.query(
@@ -194,7 +198,10 @@ const isWeekend = (day) => { const d = kuwaitDow(day); return d === 5 || d === 6
 function isClosed(phase, nowMins, day = null) {
   if (day != null && isWeekend(day)) return true;
   if (phase != null && phase !== 'Trading') return true;          // Close Auction / Trading at Last / Close-Of-Day
-  if (nowMins >= TRADING_DAY_END_MINS) return true;               // past the close, whatever the phase reads
+  // Continuous trading ends at 13:00 (SESSION.closeAt): from then on no new
+  // position, whatever the phase reads — a "Trading" quote at 13:05 is a
+  // capture lag, not a session. (The old rule closed at 13:30, the data window.)
+  if (nowMins >= sessionClock.get().closeAt) return true;
   return false;
 }
 
@@ -212,7 +219,7 @@ async function evaluate(day, { db = pool, now = testNow() } = {}) {
       ? `${kuwaitDow(day) === 5 ? 'Friday' : 'Saturday'} — no session on Boursa Kuwait`
       : phase && phase !== 'Trading'
         ? `the market is closed (${phase}) — the trading day is over`
-        : 'past 13:30 — the trading day is over';
+        : `past ${sessionClock.get().closeClock} — continuous trading is over`;
     return {
       day: toDay(day), now: new Date(now).toISOString(), clock: minsToClock(nowMinsEarly),
       market: { verdict: 'closed', reason, breadthPct: null, at: null, dropPts: null, hourAgo: null,

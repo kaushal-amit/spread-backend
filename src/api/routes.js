@@ -746,14 +746,18 @@ function build() {
     res.json({
       ...present.sessionInfo({ ...p, hour: k.getUTCHours(),
         timeStr: k.toISOString().slice(11, 16),
-        // C14 · computed, not 0/false. The step-down is 12:00 Kuwait; "late to
-        // open" is a position not posted by 09:30.
-        minutesToStepDown: p.open ? Math.max(0, 720 - mins) : 0,
+        // C14 · computed, not 0/false — from lib/session (kb late_session_hhmm),
+        // not a 720 literal. "Late to open" is a position not posted by 09:30.
+        minutesToStepDown: p.open ? p.minutesToStepDown : 0,
         lateToOpen: p.open && mins >= 570 },
         row ? Number(row.drift) : 0),
       open: !!p.open,
       kuwaitDay: daily.kuwaitDay(),
-      reserveReleased: mins >= 660,
+      // The reserve releases at kb reserve_release_hhmm (sizing.js reads the
+      // same row); the 660 literal here disagreed with it.
+      reserveReleased: mins >= require('../lib/session').hhmmToMins(
+        require('../config/thresholds').get('reserve_release_hhmm') ?? 1100),
+      clocks: p.clocks,
       // The whole curve, so the banner stops carrying its own copy.
       driftByHour: rows.map((r2) => ({
         hour: Number(r2.hr), driftFils: Number(r2.drift), sessions: Number(r2.sessions) })),

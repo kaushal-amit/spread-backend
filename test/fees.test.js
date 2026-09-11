@@ -25,6 +25,7 @@ const DAY = '2026-08-24';
   const clean = async () => {
     await fx.clearLegs('FEE');
     await fx.clearBrokerOrders('FEE');
+    await fx.clearQuotes('FEE');
     for (const sym of ['FEESPLIT', 'FEEDUP', 'FEENONE', 'FEEEXEC', 'FEEJOB']) await fx.instrument(sym);
   };
   try {
@@ -130,6 +131,10 @@ const DAY = '2026-08-24';
         q.some((x) => Number(x.delta) !== 0), q);
 
     console.log('\n=== R-31 · the 13:45 job (stats:daily) reconciles fees after the stats ===');
+    // stats:daily refuses a 0-quote run on a day the calendar calls a session
+    // (batch 6: holiday ≠ failure, but an empty session day IS one). One quote
+    // makes 2026-08-24 a real session day for the job.
+    await fx.quote('FEEJOB', { day: DAY, at: `${DAY}T07:30:00Z`, last: 205, bid: 204, offer: 206 });
     const jobFee = COMMISSION.sideFeeKd((205 * 1000) / 1000, { day: DAY, executions: null });
     await pool.query(
       `INSERT INTO spread.order_leg (trading_day, symbol, contract_seq, side, status,

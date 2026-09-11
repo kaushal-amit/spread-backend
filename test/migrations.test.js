@@ -64,7 +64,11 @@ for (const f of files) {
       || f === '019_kuwait_day.sql' || f === '020_session_stops.sql' || f === '021_bid_age_stop.sql'
       // 038 recreates v_depth with DROP ... CASCADE over public.awsat_stock_depth —
       // real Postgres only, like 010; the view is exercised in ladder/bidage/halts.
-      || f === '038_v_depth_day_key.sql') {
+      || f === '038_v_depth_day_key.sql'
+      // 039 seeds the exchange holidays and downgrades a day only WHERE NOT
+      // EXISTS quotes in public.awsat_market_quotes — real Postgres only;
+      // the calendar is exercised in phase0 scenario H / stats.
+      || f === '039_holidays_2026.sql') {
     chk(f + '  skipped here — needs real Postgres and public.* tables',
        true, 'verified in views.test.js against a kse-shaped database');
     continue;

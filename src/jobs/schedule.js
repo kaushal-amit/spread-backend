@@ -155,6 +155,15 @@ function dailySlot({ name, time, exists, run, db, now }) {
     const day = kuwaitDay(new Date(now()));
     if (done.has(day) || kuwaitHHMM(now()) < time) return 'idle';
     if (lastAttempt != null && now() - lastAttempt < backoffMs) return 'idle';
+    // A holiday is not a failure: a day the calendar marks closed is a skip
+    // with one log line, never a red. An empty SESSION day still fails loudly
+    // inside run() — that is a capture defect.
+    const cal = await require('../lib/calendar').sessionDay(day, db);
+    if (!cal.session) {
+      log.info(`[${name}] ${day} is not a session (${cal.reason}${cal.name ? `: ${cal.name}` : ''}) — skipped`);
+      done.add(day);
+      return 'idle';
+    }
     if (await exists(day, db)) { done.add(day); return 'idle'; }
     lastAttempt = now();
     try {
@@ -210,4 +219,19 @@ function startM45Scheduler({ db = pool, everyMs = 60000, time = M45_TIME, now = 
   return setInterval(() => { Promise.resolve(wrapped()).catch((e) => log.warn('[m45-schedule]', e.message)); }, everyMs);
 }
 
-module.exports = { startDailyStatsScheduler, startM45Scheduler, dailySlot, backfill, missingDays, runToday, statsExist, m45Exist, kuwaitHHMM };
+/**
+ * The ceiling re-derive nag (services/ceiling.js): once a day from 09:00,
+ * and immediately at boot, from 1 Oct 2026 until band-ceiling is saved.
+ * Runs on the same slot machinery; "exists" = already re-derived.
+ */
+function startCeilingCheck({ db = pool, everyMs = 60000, time = '09:00', now = Date.now, guard = null, current = () => null } = {}) {
+  const ceiling = require('../services/ceiling');
+  const exists = async (day, d) => (day < ceiling.ABOLISHED) || (await ceiling.rederived(d)).yes;
+  const run = ({ db: d, day }) => ceiling.check(day, { db: d, current: current() });
+  const body = dailySlot({ name: 'ceiling-check', time, exists, run, db, now });
+  const wrapped = guard ? guard('ceilingCheck', body) : body;
+  Promise.resolve(wrapped()).catch((e) => log.warn('[ceiling-check]', e.message));
+  return setInterval(() => { Promise.resolve(wrapped()).catch((e) => log.warn('[ceiling-check]', e.message)); }, everyMs);
+}
+
+module.exports = { startDailyStatsScheduler, startM45Scheduler, startCeilingCheck, dailySlot, backfill, missingDays, runToday, statsExist, m45Exist, kuwaitHHMM };

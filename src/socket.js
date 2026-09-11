@@ -21,7 +21,7 @@ const whatsapp = require('./services/whatsapp');
 const claude = require('./services/ai/claude');
 const rules = require('./lib/orderRules');
 const pricing = require('./lib/pricing');
-const { BUDGET, ALERT, SESSION, EXIT } = require('./config/spread.config');
+const { BUDGET, ALERT } = require('./config/spread.config');
 
 const TICK_MS = Number(process.env.TICK_MS || 15000);
 const room = (day) => `day:${day}`;
@@ -116,19 +116,9 @@ function scannerHealth() {
   return out;
 }
 
-/** Is the market open right now? Every clock display must ask this first. */
-function sessionPhase(now = new Date()) {
-  const k = new Date(now.getTime() + SESSION.timezoneOffsetHours * 3600000);
-  const mins = k.getUTCHours() * 60 + k.getUTCMinutes();
-  const dow = k.getUTCDay();
-  if (dow === 5 || dow === 6) return { open: false, phase: 'closed', note: 'weekend' };
-  if (mins < 540) return { open: false, phase: 'pre_open', note: 'opens at 09:00' };
-  if (mins < 600) return { open: true, phase: 'open', note: 'first hour — widest spreads' };
-  if (mins < 660) return { open: true, phase: 'peak', note: 'peak hour' };
-  if (mins < 720) return { open: true, phase: 'step_down', note: 'past the step-down' };
-  if (mins < 780) return { open: true, phase: 'late', note: 'last hour — drift is negative' };
-  return { open: false, phase: 'closed', note: 'session over' };
-}
+/** Is the market open right now? Every clock display must ask this first.
+ *  ONE source — lib/session.js; the literals that lived here are gone. */
+const { sessionPhase } = require('./lib/session');
 
 function registerHandlers(io) {
   /*
@@ -387,7 +377,7 @@ async function ruleAlerts(day, io) {
   if (hard.due) {
     io.to(r).emit('spread:alert', {
       kind: 'hard_exit', level: 'danger',
-      title: `${EXIT.hardExitAtClock} — flatten before the close`,
+      title: `${require('./lib/session').get().hardExitClock} — flatten before the close`,
       body: hard.message, at: new Date().toISOString(),
     });
   }
@@ -742,9 +732,8 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
         // configured: with none, send() logs the exact line it WOULD have sent
         // and the row records channel 'console' with the reason — nothing silent.
         // Bounded and never throwing; a real failure raises to the terminal.
-        // TRADEABLE goes out as the trade; NOT COMPUTED goes out as a one-line
-        // reject naming the missing input. Every other verdict stays on the
-        // feed only (whatsapp.shouldDeliver).
+        // EVERY resume goes to the phone — TRADEABLE as the trade, every reject
+        // as its one-line reason. Only TRADEABLE is audible (above).
         if (whatsapp.shouldDeliver(res)) {
           whatsapp.sendResume(res).then(async (wr) => {
             const channel = wr.provider || 'console';

@@ -269,18 +269,21 @@ function checkSellPosted({ buyFilledAt, sellPostedAt, now = new Date() }) {
 }
 
 /* I8 · No overnight carry — prompt to flatten at the hard exit hour. */
-function checkHardExit({ hasPosition, now = new Date(), hardExitAt = EXIT.hardExitAtClock }) {
+function checkHardExit({ hasPosition, now = new Date(), hardExitAt = null }) {
   if (!hasPosition) return { due: false };
+  const session = require('./session');
+  const c = session.get();
+  const at = hardExitAt || c.hardExitClock;           // kb hard_exit_hhmm, else the config fallback
   const k = new Date(now.getTime() + 3 * 3600000);
   const mins = k.getUTCHours() * 60 + k.getUTCMinutes();
-  const [h, m] = hardExitAt.split(':').map(Number);
+  const [h, m] = at.split(':').map(Number);
   const left = h * 60 + (m || 0) - mins;
 
   if (left > 0) return { due: false, minutesLeft: left };
   return { due: true, minutesLate: -left,
-    message: `${hardExitAt} — flatten now, be flat by 12:45 (not into the auction). Never carry ` +
+    message: `${at} — flatten now, be flat by ${c.flatByClock} (not into the auction). Never carry ` +
              'overnight either — every overnight hold in ten sessions lost money, the worst −44.94 ' +
-             'over a weekend. Hit the bid if the offer will not lift; after 12:45 it is too late to trade.' };
+             `over a weekend. Hit the bid if the offer will not lift; after ${c.flatByClock} it is too late to trade.` };
 }
 
 module.exports = {

@@ -68,16 +68,15 @@ function enabled() {
  *  "FUTUREKID resumed 142 · TRADEABLE · target 147 stop 137" */
 function alertText(res) {
   const price = res.resumePriceFils ?? res.resumePrice;
-  // "FTI resumed 149 · NOT COMPUTED — no book captured": the reject names the
-  // missing input, so the phone says which capture failed, not just "no".
-  if (res.notComputed || res.verdict === 'NOT COMPUTED') {
-    return `${res.symbol} resumed ${price ?? '—'} · NOT COMPUTED — ${res.verdictDetail || 'missing input'}`;
-  }
-  const parts = [`${res.symbol} resumed ${price}`, res.verdict];
+  // A TRADEABLE resume is the trade line; every reject is ONE line naming the
+  // verdict and its reason — "FTI resumed 149 · NOT COMPUTED — no book
+  // captured", "SLTB resumed 142 · NO BID — touch bid is 0 …". The phone and
+  // the feed carry the same lines.
   if (res.tradeable && res.targetFils != null && res.stopFils != null) {
-    parts.push(`target ${res.targetFils} stop ${res.stopFils}`);
+    return `${res.symbol} resumed ${price} · ${res.verdict} · target ${res.targetFils} stop ${res.stopFils}`;
   }
-  return parts.join(' · ');
+  const detail = res.verdictDetail ? ` — ${res.verdictDetail}` : '';
+  return `${res.symbol} resumed ${price ?? '—'} · ${res.verdict}${detail}`;
 }
 
 async function postMeta(c, to, text) {
@@ -193,16 +192,17 @@ async function send(text, { to: toOverride } = {}) {
     sent, failed: results.length - sent, results };
 }
 
-/** Send the alert for a resume payload if it is TRADEABLE — or NOT COMPUTED,
- *  which goes out as a one-line reject naming the missing input (a halt the
- *  operator does not hear about is the failure the detector exists to stop).
- *  Every other non-TRADEABLE verdict returns { ok:false, reason:'NOT_TRADEABLE' }
- *  WITHOUT sending. */
+/** EVERY resume is delivered — TRADEABLE as the trade line, every reject
+ *  (NO BID, BOOK TOO DEEP, NOT COMPUTED, …) as its one-line reason. A halt the
+ *  operator does not hear about is the failure the detector exists to prevent;
+ *  the feed and the phone carry the same lines, and only TRADEABLE is AUDIBLE
+ *  (socket.js `audible: res.tradeable`). A payload with no verdict at all is
+ *  not a resume and is not sent. */
 function shouldDeliver(res) {
-  return !!res && (res.tradeable === true || res.notComputed === true || res.verdict === 'NOT COMPUTED');
+  return !!res && typeof res.verdict === 'string' && res.verdict.length > 0;
 }
 async function sendResume(res) {
-  if (!shouldDeliver(res)) return { ok: false, reason: 'NOT_TRADEABLE', sent: 0 };
+  if (!shouldDeliver(res)) return { ok: false, reason: 'NO_VERDICT', sent: 0 };
   return send(alertText(res));
 }
 

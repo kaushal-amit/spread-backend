@@ -21,6 +21,24 @@ const { pool } = require('../db');
 const { toDay, daysBetween, isWeekday } = require('../lib/day');
 
 
+/**
+ * Boursa Kuwait's published market holidays (boursakuwait.com.kw › Trading ›
+ * Market Holidays). Migration 039 seeds the same list; this keeps `npm run
+ * calendar` self-sufficient and is where a Council-of-Ministers closure goes.
+ * A day that TRADED stays a session whatever this says.
+ */
+const HOLIDAYS = {
+  '2026-01-01': 'New Year',
+  '2026-01-18': 'Ascension of Prophet Mohammed',
+  '2026-02-25': 'National Day',
+  '2026-02-26': 'Liberation Day',
+  '2026-03-19': 'Eid Al Fitr', '2026-03-22': 'Eid Al Fitr',
+  '2026-05-26': 'Arafat Day',
+  '2026-05-27': 'Eid Al Adha', '2026-05-28': 'Eid Al Adha',
+  '2026-06-16': 'Hijri New Year',
+  '2026-08-27': 'Prophet Mohammed Birthday',
+};
+
 async function seed({ from = '2026-01-01', to = null, db = pool, log = console } = {}) {
   const end = to || new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
 
@@ -56,20 +74,24 @@ async function seed({ from = '2026-01-01', to = null, db = pool, log = console }
   // ---- 2 · fill the range -------------------------------------------------
   const rows = [];
   for (const day of daysBetween(from, end)) {
-    // Observation beats the weekday rule: a holiday that traded is a session.
-    rows.push([day, seen.has(day) || isWeekday(day)]);
+    // Observation beats the weekday rule AND the holiday list: a day that
+    // traded is a session. Otherwise a published holiday is closed.
+    const holiday = HOLIDAYS[day] || null;
+    rows.push([day, seen.has(day) || (isWeekday(day) && !holiday), seen.has(day) ? null : holiday]);
   }
 
   let n = 0;
-  for (const [day, isSession] of rows) {
+  for (const [day, isSession, holiday] of rows) {
     await db.query(
-      `INSERT INTO spread.trading_day (trading_day, is_session)
-       VALUES ($1, $2)
+      `INSERT INTO spread.trading_day (trading_day, is_session, holiday_name)
+       VALUES ($1, $2, $3)
        ON CONFLICT (trading_day) DO UPDATE
-         -- Never downgrade a day we have quotes for. Observation beats the
-         -- weekday rule; a holiday that traded is a session.
-         SET is_session = spread.trading_day.is_session OR EXCLUDED.is_session;`,
-      [day, isSession]);
+         -- Never downgrade a day we have quotes for; a holiday with no quotes
+         -- is closed even if an earlier seed marked it open.
+         SET is_session = CASE WHEN $3::text IS NOT NULL THEN false
+                               ELSE spread.trading_day.is_session OR EXCLUDED.is_session END,
+             holiday_name = COALESCE($3::text, spread.trading_day.holiday_name);`,
+      [day, isSession, holiday]);
     n++;
   }
 
@@ -112,7 +134,7 @@ async function seed({ from = '2026-01-01', to = null, db = pool, log = console }
   };
 }
 
-module.exports = { seed };
+module.exports = { seed, HOLIDAYS };
 
 if (require.main === module) {
   const arg = (k) => { const i = process.argv.indexOf(k); return i >= 0 ? process.argv[i + 1] : null; };

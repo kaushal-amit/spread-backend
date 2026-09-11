@@ -180,6 +180,24 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
   }
 
   /*
+   * The two screener facts the reference's chips SELECT on, defined by Amit
+   * (10 Sep) and measured here, never inferred in the browser:
+   *   NEVER TRADED    no spread.order_leg row for the symbol, EVER — our own
+   *                   ledger, any day (not "active on 0 of 5 sessions", which
+   *                   is the market's activity, a different question).
+   *   BOOK CAPTURED   at least one depth capture for the symbol TODAY (v_depth
+   *                   on the day key) — not dataQuality, which is symbol_day's
+   *                   quote-capture grade.
+   * Two set queries per board build; the sets ride the board cache.
+   */
+  const facts = await screenerFacts(tradingDay, db);
+  for (const r of results) {
+    const sym = String(r.symbol).toUpperCase();
+    r.everTraded = facts.traded.has(sym);
+    r.bookCapturedToday = facts.captured.has(sym);
+  }
+
+  /*
    * SPR-38 · THREE BUCKETS, NOT TWO. A gate that could not be computed (its
    * statistic is missing) is not a failed stock — so a card that fails ONLY on
    * NOT COMPUTED gates belongs in its own bucket, never in `rejected`. Filing
@@ -224,6 +242,15 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
     },
     bands: funnel.tickBands(budgetKd, cfg, targets),
   };
+}
+
+/** { traded: Set<symbol with any order_leg row ever>, captured: Set<symbol with a depth capture on `day`> } */
+async function screenerFacts(day, db = pool) {
+  const [{ rows: t }, { rows: c }] = await Promise.all([
+    db.query('SELECT DISTINCT upper(symbol) AS symbol FROM spread.order_leg;'),
+    db.query('SELECT DISTINCT upper(symbol) AS symbol FROM spread.v_depth WHERE trading_date = $1::date;', [day]),
+  ]);
+  return { traded: new Set(t.map((r) => r.symbol)), captured: new Set(c.map((r) => r.symbol)) };
 }
 
 /**

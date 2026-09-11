@@ -252,6 +252,13 @@ function stockCandidate(r, budgetKd) {
     },
     dataQuality: r.dataQuality || 'OK',
     dataQualityPct: r.capturePct == null ? undefined : n2(r.capturePct),
+    // The screener's two facts (screening.js screenerFacts), measured server
+    // side: NEVER TRADED = everTraded false (no order_leg row ever); BOOK
+    // CAPTURED = bookCapturedToday true (≥ 1 depth capture today). null when
+    // the board was built without them (a review board, a fixture) — the chip
+    // then matches nothing rather than everything.
+    everTraded: typeof r.everTraded === 'boolean' ? r.everTraded : null,
+    bookCapturedToday: typeof r.bookCapturedToday === 'boolean' ? r.bookCapturedToday : null,
     // C-01 · a gate that failed for want of a NUMBER, named. The screen must
     // render these differently from a stock that is bad — for weeks they were
     // indistinguishable and the board read as a quiet market.
@@ -413,7 +420,7 @@ function tradingContract(c) {
     targetNormal: n2n(c.targetNormalFils),
     targetTrending: n2n(c.targetTrendingFils),
     peakSinceFill: n2n(c.peakBidFils),
-    stepDownTime: EXIT.stepDownAtClock,
+    stepDownTime: require('../lib/session').get().stepDownClock,
     // B-08 · shares is what is STILL HELD; boughtShares is the fill. They
     // differ after a partial sell, and the difference used to be invisible.
     boughtShares: Number(c.boughtShares ?? c.shares ?? 0),

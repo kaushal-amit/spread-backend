@@ -1,7 +1,7 @@
 /**
  * WhatsApp alerts for TRADEABLE halt-resumes (services/whatsapp.js).
  *   · a TRADEABLE resume produces the one-line alert and posts it to the provider
- *   · a non-TRADEABLE resume sends NOTHING (sendResume short-circuits)
+ *   · a non-TRADEABLE resume sends its one-line reject (only TRADEABLE is audible)
  *   · the Meta and Twilio providers hit the right URL with the right auth/body
  *   · a provider rejection (non-2xx) comes back ok:false, never throws
  *   · a network throw comes back ok:false, never throws
@@ -45,7 +45,8 @@ function clearEnv() {
   chk('unconfigured send returns WHATSAPP_UNCONFIGURED (not a throw)',
     un.ok === false && un.reason === 'WHATSAPP_UNCONFIGURED', un);
 
-  // ── a non-TRADEABLE resume never sends ──
+  // ── a non-TRADEABLE resume sends its ONE-LINE reject (10 Sep: every verdict
+  //    goes to the phone; only TRADEABLE is audible) ──
   clearEnv();
   process.env.WHATSAPP_PROVIDER = 'twilio';
   process.env.WHATSAPP_TO = '+96599999999';
@@ -53,8 +54,10 @@ function clearEnv() {
   process.env.WHATSAPP_TWILIO_TOKEN = 'tok';
   process.env.WHATSAPP_TWILIO_FROM = 'whatsapp:+14155238886';
   stubFetch(() => okJson({ sid: 'SM1' }));
-  const noSend = await wa.sendResume(REJECT);
-  chk('sendResume on a NON-tradeable resume sends nothing', noSend.ok === false && noSend.reason === 'NOT_TRADEABLE' && calls.length === 0, noSend);
+  const rejSend = await wa.sendResume(REJECT);
+  chk('sendResume on a NON-tradeable resume SENDS the reject line', rejSend.ok === true && calls.length === 1, rejSend);
+  chk('  and the line carries the verdict, not a target', /resumed .* · /.test(wa.alertText(REJECT)) && !/target/.test(wa.alertText(REJECT)), wa.alertText(REJECT));
+  calls.length = 0;
 
   // ── Twilio: right URL, basic auth, whatsapp: body ──
   stubFetch(() => okJson({ sid: 'SM42' }));

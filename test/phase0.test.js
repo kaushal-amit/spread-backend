@@ -54,6 +54,32 @@ async function run() {
     ck('no day → the pre-October figure (unchanged default)', g2({}).roundTripKd === sep.roundTripKd);
   }
 
+  // ── ONE session clock (lib/session): kb rows, not literals ────────────────
+  {
+    const session = require('../src/lib/session');
+    const at = (h, m) => new Date(Date.UTC(2026, 8, 10, h - 3, m)); // Thu 10 Sep, Kuwait
+    ck('09:30 open · 11:30 step_down · 12:30 late · 13:05 closed (closing auction, no new positions)',
+      session.sessionPhase(at(9, 30)).phase === 'open' && session.sessionPhase(at(11, 30)).phase === 'step_down'
+      && session.sessionPhase(at(12, 30)).phase === 'late' && session.sessionPhase(at(13, 5)).phase === 'closed'
+      && session.sessionPhase(at(13, 5)).open === false && /closing auction/.test(session.sessionPhase(at(13, 5)).note));
+    ck('the data window outlives the close: 13:20 dataWindow yes, 13:40 no',
+      session.sessionPhase(at(13, 20)).dataWindow === true && session.sessionPhase(at(13, 40)).dataWindow === false);
+    ck('minutesToStepDown counts to late_session (12:00): 30 at 11:30, 0 after',
+      session.sessionPhase(at(11, 30)).minutesToStepDown === 30 && session.sessionPhase(at(12, 10)).minutesToStepDown === 0);
+    ck('Friday is closed with no countdown', session.sessionPhase(new Date(Date.UTC(2026, 8, 11, 7, 0))).phase === 'closed');
+    // the kb rows move the clocks — a stub db returning a 10:30 step-down
+    const stub = { query: async () => ({ rows: [{ key: 'step_down_hhmm', value: 1030 }, { key: 'hard_exit_hhmm', value: 1215 }] }) };
+    const c = await session.load(stub);
+    ck('load() reads step_down_hhmm / hard_exit_hhmm from kb_threshold; missing keys keep the fallback',
+      c.stepDownAt === 10 * 60 + 30 && c.hardExitAt === 12 * 60 + 15 && c.flatByAt === 12 * 60 + 45 && c.loadedFrom === 'kb_threshold', c);
+    ck('  and the phase follows: 10:45 is now step_down', session.sessionPhase(at(10, 45)).phase === 'step_down');
+    ck('  checkHardExit reads the same clock (due at 12:15)',
+      require('../src/lib/orderRules').checkHardExit({ hasPosition: true, now: at(12, 16) }).due === true
+      && require('../src/lib/orderRules').checkHardExit({ hasPosition: true, now: at(12, 10) }).due === false);
+    await session.load({ query: async () => ({ rows: [] }) }); // back to the config fallbacks
+    ck('socket.sessionPhase IS lib/session.sessionPhase', require('../src/socket').sessionPhase === session.sessionPhase);
+  }
+
   // ── the day rolls: sockets that follow "today" move rooms ─────────────────
   {
     const mk = (day, follows) => { const joined = [], left = [], sent = []; return { data: { day, followsToday: follows }, join: (r) => joined.push(r), leave: (r) => left.push(r), emit: (ev, a) => sent.push([ev, a]), joined, left, sent }; };
@@ -207,6 +233,38 @@ async function run() {
     ck('retried after 2 minutes and succeeded', dailyCalls.length === 3, dailyCalls);
     E.setClock('2026-09-02T11:30:00Z'); await sleep(30);
     ck('once done, no further runs that day', dailyCalls.length === 3, dailyCalls);
+
+    // Scenario H · a HOLIDAY is a skip, not a red (lib/calendar → spread.trading_day).
+    dailyCalls = [];
+    const holidayDb = { query: async (sql) => {
+      if (/FROM spread\.trading_day WHERE trading_day/.test(sql)) return { rows: [{ is_session: false, holiday_name: 'Prophet Mohammed Birthday' }] };
+      if (/FROM spread\.symbol_day_stats WHERE trading_day/.test(sql)) return { rows: [] };
+      return { rows: [] };
+    } };
+    handles.push(schedule.startDailyStatsScheduler({ db: holidayDb, everyMs: 10, time: '13:45', now: () => Date.parse('2026-08-27T11:30:00Z'), guard: null, runBackfill: false }));
+    await sleep(40);
+    ck('27 Aug (a published holiday, a Thursday) past 13:45 with no row → skipped, the daily never runs', dailyCalls.length === 0, dailyCalls);
+
+    // Scenario I · an EMPTY session day is a loud failure in runDaily, never a 0-row success.
+    {
+      const emptyDb = { query: async (sql) => {
+        if (/count\(\*\).*FROM public\.awsat_market_quotes WHERE trading_date/.test(sql)) return { rows: [{ n: 0 }] };
+        if (/FROM spread\.trading_day WHERE trading_day/.test(sql)) return { rows: [] };
+        return { rows: [] };
+      } };
+      const stubbed = stats.runDaily; stats.runDaily = realRunDaily; // the REAL runDaily for this scenario
+      let threw = null;
+      try { await stats.runDaily('2026-09-09', { db: emptyDb }); } catch (e) { threw = e.message; }
+      ck('runDaily on a session day with no quotes throws naming the capture defect', /capture defect/.test(threw || ''), threw);
+      const holidayEmpty = { query: async (sql) => {
+        if (/count\(\*\).*FROM public\.awsat_market_quotes WHERE trading_date/.test(sql)) return { rows: [{ n: 0 }] };
+        if (/FROM spread\.trading_day WHERE trading_day/.test(sql)) return { rows: [{ is_session: false, holiday_name: 'Eid' }] };
+        return { rows: [] };
+      } };
+      const sk = await stats.runDaily('2026-05-27', { db: holidayEmpty });
+      ck('runDaily on a holiday with no quotes returns skipped:holiday, no throw', sk.skipped === 'holiday' && sk.rows === 0, sk);
+      stats.runDaily = stubbed;
+    }
 
     // Scenario F · done is the TABLE: a row already present → nothing runs.
     dailyCalls = [];

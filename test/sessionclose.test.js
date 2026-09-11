@@ -47,7 +47,15 @@ const kut = (hh, mm) => new Date(Date.UTC(2003, 5, 8, hh - 3, mm, 0));
     await fx.quote(SYM, { day: DAY, at: kut(14, 45).toISOString(), session: 'Trading', last: 100, bid: 99, offer: 101 });
     const stuck = await stops.evaluate(DAY, { now: kut(14, 47) });
     chk('past 13:30 with a stuck Trading capture → closed', stuck.mode === 'closed' && stuck.closed === true, [stuck.mode, stuck.marketPhase]);
-    chk('reason names the 13:30 rule', /13:30/.test(stuck.reasons.join(' ')), stuck.reasons);
+    chk('reason names the close (13:00 — continuous trading over)', /13:00/.test(stuck.reasons.join(' ')), stuck.reasons);
+    // 10 Sep · canOpen follows the 13:00 close, not the 13:30 data window: a
+    // "Trading" quote at 13:05 is a capture lag, not a session.
+    await fx.clearQuotes(SYM);
+    await fx.quote(SYM, { day: DAY, at: kut(13, 3).toISOString(), session: 'Trading', last: 100, bid: 99, offer: 101 });
+    const lag = await stops.evaluate(DAY, { now: kut(13, 5) });
+    chk('13:05 with a Trading quote → closed (continuous trading ended 13:00)', lag.closed === true && lag.canOpen === false, [lag.mode, lag.reasons]);
+    const late = await stops.evaluate(DAY, { now: kut(12, 58) });
+    chk('12:58 → not closed (past flat-by, but the session is on)', late.closed === false, [late.closed, late.mode]);
 
     console.log('\n=== no recent reading → NULL phase → evaluates (July capture defect) ===');
     await fx.clearQuotes(SYM);

@@ -81,9 +81,15 @@ const rowOf = async (id) => (await pool.query(
     chk('delivered_at stays NULL (nothing was sent)', r2.delivered_at == null, r2);
     chk('and the reason is on the row', r2.delivery_error === 'WHATSAPP_UNCONFIGURED', r2);
 
-    console.log('\n=== a non-TRADEABLE resume does not push ===');
-    const skip = await whatsapp.sendResume({ ...res, tradeable: false, verdict: 'UP HALT — SKIP' });
-    chk('NOT_TRADEABLE, no send', skip.ok === false && skip.reason === 'NOT_TRADEABLE', skip);
+    console.log('\n=== EVERY reject pushes as one line (only TRADEABLE is audible) ===');
+    chk('a reject line reads "SYM resumed 244 · UP HALT — SKIP — <reason>"',
+      whatsapp.alertText({ ...res, tradeable: false, verdict: 'UP HALT — SKIP', verdictDetail: 'an upward halt leans negative' })
+        === `${SYM} resumed 244 · UP HALT — SKIP — an upward halt leans negative`, whatsapp.alertText({ ...res, tradeable: false, verdict: 'UP HALT — SKIP', verdictDetail: 'an upward halt leans negative' }));
+    chk('shouldDeliver: every verdict, TRADEABLE or not; nothing without a verdict',
+      whatsapp.shouldDeliver({ ...res, tradeable: false, verdict: 'NO BID' }) && whatsapp.shouldDeliver({ ...res, tradeable: false, verdict: 'BOOK TOO DEEP' })
+      && whatsapp.shouldDeliver(res) && !whatsapp.shouldDeliver({ symbol: SYM }));
+    const skip = await whatsapp.sendResume({ symbol: SYM, resumePriceFils: 244 });
+    chk('a payload with no verdict is not a resume — not sent', skip.ok === false && skip.reason === 'NO_VERDICT', skip);
 
     console.log('\n=== H-V1 · a NOT COMPUTED resume pushes a one-line reject naming the missing input ===');
     // Configured again (the unconfigured block above cleared the env).
@@ -101,8 +107,7 @@ const rowOf = async (id) => (await pool.query(
     chk('the verdict is NOT COMPUTED, not tradeable', nc.verdict === 'NOT COMPUTED' && nc.tradeable === false && nc.notComputed === true, nc);
     chk('the line reads "FTI resumed 149 · NOT COMPUTED — no book captured"',
       whatsapp.alertText(nc) === 'FTI resumed 149 · NOT COMPUTED — no book captured', whatsapp.alertText(nc));
-    chk('shouldDeliver: yes for NOT COMPUTED, no for the other rejects',
-      whatsapp.shouldDeliver(nc) === true && whatsapp.shouldDeliver({ ...res, tradeable: false, verdict: 'BOOK TOO DEEP' }) === false);
+    chk('shouldDeliver: yes for NOT COMPUTED (like every reject)', whatsapp.shouldDeliver(nc) === true);
     const ncSend = await whatsapp.sendResume(nc);
     chk('it is SENT', ncSend.ok === true && calls.length === 1, ncSend);
     chk('  with the reject line', /NOT COMPUTED/.test(decodeURIComponent(calls[0].opts.body).replace(/\+/g, ' ')), calls[0]?.opts.body);
