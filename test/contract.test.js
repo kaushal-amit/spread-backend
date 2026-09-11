@@ -27,6 +27,32 @@ console.log('=== StockCandidate ===');
     capturePct: 100, dataQuality: 'OK', behaviour: [], structural: false,
   };
   const c = present.stockCandidate(row, 790);
+
+  // A NUMBER THAT IS NOT KNOWN TRAVELS AS NULL, NEVER AS 0. With the stats
+  // bridge empty the old presenter printed price 0, bid 0, "tiny 0% · mv 0 ·
+  // vol 0×" for 140 NOT COMPUTED symbols — and 0 is a measurement.
+  const nc = present.stockCandidate({
+    symbol: 'NCX', priceFils: null, bidFils: null, offerFils: null, spreadFils: null, changeFils: null,
+    entryPlacement: 'AT_BID', passed: false, failed: ['price band'], reasons: ['price not computed'],
+    gates: [{ id: 1, label: 'Price band', ok: false, value: '—', notComputed: true }],
+    netAtTarget: null, entry: null, reachable: true, minBudgetKd: null, maxBudgetKd: null,
+    capturePct: null, behaviour: [], structural: false, notComputed: ['price band'],
+    avg_trade_shares: null, price_moves: null, price_moves_2plus: null, pct_moves_sub100: null,
+    pct_session_postable_800: null, pct_session_exitable_ratio: null, volume_ratio_5d: null,
+    days_active_5d: null, gap_pct: null, range_trading_fils: null,
+  }, 790);
+  chk('unknown price/bid/offer/spread travel as null, not 0',
+    nc.price === null && nc.bid === null && nc.offer === null && nc.spread === null, JSON.stringify([nc.price, nc.bid, nc.offer, nc.spread]));
+  chk('unknown net/notional/round-trip/shares are null', nc.netKd === null && nc.notionalKd === null && nc.roundTripKd === null && nc.shares === null);
+  chk('unknown change is null, not 0 (0 would read "flat")', nc.changeFils === null && nc.changePct === null);
+  chk('every unknown metric is null', ['tradeSizeShares', 'movesPerDay', 'moves2PlusPerDay', 'tapeQualityPct', 'postablePct',
+    'exitDepthPct', 'volSpikeRatio', 'outwardBlockFlowRatio', 'consistencyDays', 'gapPresentPct', 'dailyRangeFils', 'priceFils']
+    .every((k) => nc.metrics[k] === null), JSON.stringify(nc.metrics));
+  chk('headroom is null when unknown, not 0', nc.headroom.minKd === null && nc.headroom.maxKd === null && nc.headroom.headroomX === null);
+  chk('a KNOWN zero is still 0 (0 moves is dead, not uncounted)',
+    present.stockCandidate({ ...row, price_moves: 0, changeFils: 0 }, 790).metrics.movesPerDay === 0
+    && present.stockCandidate({ ...row, price_moves: 0, changeFils: 0 }, 790).changeFils === 0);
+
   // R-06 · walkedUp is a SERVER field, so the browser stops recomputing it.
   const wu = present.stockCandidate({ ...row, pct_moves_sub100: 15, pct_moves_sub100_up: 32 }, 790);
   chk('metrics.walkedUp is emitted (32 up-only vs 15 blended → true)', wu.metrics.walkedUp === true, JSON.stringify(wu.metrics.walkedUp));

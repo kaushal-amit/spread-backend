@@ -131,35 +131,83 @@ async function runToday({ db = pool, day = kuwaitDay() } = {}) {
  * overlap its next minute-tick and so /health sees the scheduler's lastSuccessAt
  * alongside the six scanners. Passing `now`/`db` is for the test harness.
  */
+/**
+ * ONE DAILY SLOT, DONE-WHEN-DONE.
+ *
+ * The first version fired only on an exact HH:MM match and marked the day
+ * fired BEFORE running, so a failed run — or a minute the interval skipped
+ * (a slow tick, a restart at 13:45:30) — meant no stats that day and no
+ * retry. Now:
+ *   - it is due from `time` ONWARD on a session day
+ *   - "done" is the TABLE (`exists(day)`), not memory: a restart at 14:00
+ *     runs it if the row is missing and skips it if it is there (which is
+ *     also the boot catch-up — no separate code path)
+ *   - a failure is retried with backoff (1, 2, 4 … up to 30 minutes), logged
+ *     each time, never marked done
+ * Returns 'idle' when nothing was due, so the guard's health shows work vs
+ * idle honestly.
+ */
+function dailySlot({ name, time, exists, run, db, now }) {
+  const done = new Set();          // days proven done (by the table) this process
+  let lastAttempt = null, backoffMs = 0;
+  return async () => {
+    if (isWeekend(now())) return 'idle';
+    const day = kuwaitDay(new Date(now()));
+    if (done.has(day) || kuwaitHHMM(now()) < time) return 'idle';
+    if (lastAttempt != null && now() - lastAttempt < backoffMs) return 'idle';
+    if (await exists(day, db)) { done.add(day); return 'idle'; }
+    lastAttempt = now();
+    try {
+      log.info(`[${name}] ${time} Kuwait — running for ${day}`);
+      await run({ db, day });
+      done.add(day); backoffMs = 0;
+    } catch (e) {
+      backoffMs = Math.min(30 * 60000, backoffMs ? backoffMs * 2 : 60000);
+      log.warn(`[${name}] ${day} failed — retry in ${Math.round(backoffMs / 60000)} min: ${e.message}`);
+      throw e;
+    }
+    return 'ran';
+  };
+}
+
 function startDailyStatsScheduler({ db = pool, everyMs = 60000, time = STATS_TIME,
   now = Date.now, guard = null, runBackfill = true } = {}) {
-  const fired = new Set();
-
-  // Boot: catch up today if the slot already passed with no row, then backfill
-  // the historical gap. Both in the background — boot must not block on them.
-  (async () => {
-    try {
-      const day = kuwaitDay(new Date(now()));
-      if (!isWeekend(now()) && kuwaitHHMM(now()) >= time && !(await statsExist(day, db))) {
-        log.warn(`[stats-schedule] boot catch-up: ${day} is past ${time} with no bridge row — running now`);
-        fired.add(`${day} ${time}`);
-        await runToday({ db, day });
-      }
-    } catch (e) { log.warn('[stats-schedule] boot catch-up failed:', e.message); }
-    if (runBackfill) { try { await backfill({ db }); } catch (e) { log.warn('[stats-schedule] backfill error:', e.message); } }
-  })();
-
-  const body = async () => {
-    if (isWeekend(now())) return;
-    const day = kuwaitDay(new Date(now()));
-    const key = `${day} ${time}`;
-    if (kuwaitHHMM(now()) !== time || fired.has(key)) return;
-    fired.add(key);
-    log.info(`[stats-schedule] ${time} Kuwait — running the daily stats + fee reconcile for ${day}`);
-    await runToday({ db, day });
-  };
+  // Backfill the historical gap in the background — boot must not block on it.
+  // Today's catch-up is the slot itself: due from 13:45, done when the table
+  // says so.
+  if (runBackfill) {
+    (async () => { try { await backfill({ db }); } catch (e) { log.warn('[stats-schedule] backfill error:', e.message); } })();
+  }
+  const body = dailySlot({ name: 'stats-schedule', time, exists: statsExist, run: runToday, db, now });
   const wrapped = guard ? guard('statsDaily', body) : body;
+  // The first tick is immediate, so a boot after the slot catches up now.
+  Promise.resolve(wrapped()).catch((e) => log.warn('[stats-schedule]', e.message));
   return setInterval(() => { Promise.resolve(wrapped()).catch((e) => log.warn('[stats-schedule]', e.message)); }, everyMs);
 }
 
-module.exports = { startDailyStatsScheduler, backfill, missingDays, runToday, statsExist, kuwaitHHMM };
+/** Has the 09:45 window been written for this day? */
+async function m45Exist(day, db = pool) {
+  const { rows } = await db.query('SELECT 1 FROM spread.m45 WHERE trading_day = $1::date LIMIT 1', [day]);
+  return rows.length > 0;
+}
+
+/**
+ * The 09:45 job (A5). It existed only as `npm run m45` — never scheduled, so
+ * the board's m45 column read "—" every session. Same slot machinery as the
+ * stats: due from M45_HHMM (default 09:46, one minute after the window closes),
+ * done when spread.m45 has today's rows, retried on failure.
+ */
+const M45_TIME = process.env.M45_HHMM || '09:46';
+function startM45Scheduler({ db = pool, everyMs = 60000, time = M45_TIME, now = Date.now, guard = null } = {}) {
+  const run = async ({ db: d, day }) => {
+    const r = await require('./m45').computeM45(day, { db: d });
+    log.info(`[m45-schedule] ${day}: ${r.computed} computed, ${r.skipped} already present, ${r.thin} thin`);
+    return r;
+  };
+  const body = dailySlot({ name: 'm45-schedule', time, exists: m45Exist, run, db, now });
+  const wrapped = guard ? guard('m45', body) : body;
+  Promise.resolve(wrapped()).catch((e) => log.warn('[m45-schedule]', e.message));
+  return setInterval(() => { Promise.resolve(wrapped()).catch((e) => log.warn('[m45-schedule]', e.message)); }, everyMs);
+}
+
+module.exports = { startDailyStatsScheduler, startM45Scheduler, dailySlot, backfill, missingDays, runToday, statsExist, m45Exist, kuwaitHHMM };

@@ -67,8 +67,12 @@ async function assertPositionRoom(db, { exceptSymbol = null, day = null } = {}) 
   const slotKd = gateStore.sessionBudgetKd();
   if (slotKd == null) throw notReady('no session budget is set', 'set it with PUT /gates {"session-budget": 2000}');
   const COMMISSION = require('../lib/commission');
-  const feeSingleKd = COMMISSION.roundTripKd(slotKd, slotKd).kd;
-  const feeSplitKd = 2 * COMMISSION.roundTripKd(slotKd / 2, slotKd / 2).kd;
+  // Dated: the settlement fee is abolished from 1 October 2026 and the fee
+  // band must move with it, or the split-vs-single decision here disagrees
+  // with the ledger by 1 KD a round trip from that day.
+  const feeDay = day || require('../jobs/daily').kuwaitDay();
+  const feeSingleKd = COMMISSION.roundTripKd(slotKd, slotKd, { day: feeDay }).kd;
+  const feeSplitKd = 2 * COMMISSION.roundTripKd(slotKd / 2, slotKd / 2, { day: feeDay }).kd;
   const guard = rules.checkNewPosition({
     openPositions: held.size,
     maxPositions: gateStore.effective().BUDGET.maxPositions,
@@ -205,6 +209,8 @@ function mount(r) {
 
     const premier = await positions.isPremier(sym);
     const client = await pool.connect();
+    // Hoisted so the response can be built AFTER the transaction has closed.
+    let committed = false, warning = null, fee = null, expectedExecutions = null, ruleBreach = null;
     try {
       await client.query('BEGIN');
       // Every read below is INSIDE the transaction and behind the symbol lock,
@@ -213,7 +219,7 @@ function mount(r) {
       const openBuy = await positions.openBuy(sym, client);
 
       let contractSeq = seq == null ? null : Number(seq);
-      let warning = null;
+      warning = null;
 
       if (side === 'SELL') {
         if (!openBuy) {
@@ -253,23 +259,26 @@ function mount(r) {
         // R-19 / R-20 · a POSTED buy is a decision: refused under a stop. A
         // FILLED buy is a fact: booked, and the breach recorded (below).
         if (!isFill) await assertCanOpen(d, { db: client });
-        if (isFill) {
-          if (openBuy) {
-            throw refused(`${sym} already has an open position (contract ${openBuy.contract_seq}, ` +
-              `${openBuy.remaining_shares.toLocaleString('en-US')} held)`,
-              'sell it first — adding to a position is not a shape this ledger records');
-          }
-          await assertPositionRoom(client, { exceptSymbol: sym, day: d });
+        // One open position per symbol — POSTED or FILLED. The check ran only
+        // on a fill: a POSTED BUY while holding the symbol was accepted, and
+        // resolving it FILLED (whose room check excludes the symbol itself)
+        // booked a SECOND open contract in the same stock. Adding to a
+        // position is not a shape this ledger records; refuse it at the post.
+        if (openBuy) {
+          throw refused(`${sym} already has an open position (contract ${openBuy.contract_seq}, ` +
+            `${openBuy.remaining_shares.toLocaleString('en-US')} held)`,
+            'sell it first — adding to a position is not a shape this ledger records');
         }
+        if (isFill) await assertPositionRoom(client, { exceptSymbol: sym, day: d });
         if (contractSeq == null) contractSeq = await positions.allocateSeq(client, sym);
       }
 
       const notionalKd = (Number(priceFils) * (filled ?? Number(shares))) / 1000;
-      const fee = isFill
+      fee = isFill
         ? COMMISSION.sideFeeKd(notionalKd, { day: d, premier, executions: executions ?? null })
         : { kd: 0, known: true, executions: null };
 
-      let expectedExecutions = null;
+      expectedExecutions = null;
       if (isFill && !fee.known) {
         const { rows: [prof] } = await client.query(
           `SELECT avg_trade_shares FROM spread.symbol_day
@@ -291,26 +300,35 @@ function mount(r) {
         [d, sym, contractSeq, side, status, priceFils, shares,
          filled, fee.kd, executions ?? null, note ?? null, exitVenue]);
 
-      let ruleBreach = null;
+      ruleBreach = null;
       if (isFill) {
         await bookFill(client, { day: d, leg, side, shares: filled, priceFils, feeKd: fee.kd, symbol: sym });
         if (side === 'BUY') ruleBreach = await breachIfStopped(client, d, sym, { legId: leg.id, priceFils, shares: filled });
       }
       await client.query('COMMIT');
+      committed = true;
       invalidate();
-
-      res.json({
-        ok: true, warning: ruleBreach ? `${warning ? warning + ' · ' : ''}STOP BREACHED: ${ruleBreach.reasons.join(' · ')}` : warning,
-        ruleBreach,
-        commissionKnown: fee.known,
-        expectedExecutions,
-        partial: isFill && filled < Number(shares) ? { filled, of: Number(shares) } : null,
-        contracts: await contracts(d),
-      });
     } catch (e) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (!committed) await client.query('ROLLBACK').catch(() => {});
       throw e;
     } finally { client.release(); }
+
+    // AFTER the transaction, outside its try: this read used to sit inside it,
+    // so a failure here (a pool hiccup on contracts()) answered the client with
+    // an error for a write that HAD committed — and a retry booked it twice.
+    // The write is done; if the read-back fails, say so without un-saying it.
+    let contractsNow = null, readBackError = null;
+    try { contractsNow = await contracts(d); }
+    catch (e) { readBackError = 'the record is saved; the position list could not be re-read — refresh'; }
+    res.json({
+      ok: true, warning: ruleBreach ? `${warning ? warning + ' · ' : ''}STOP BREACHED: ${ruleBreach.reasons.join(' · ')}` : warning,
+      ruleBreach,
+      commissionKnown: fee.known,
+      expectedExecutions,
+      partial: isFill && filled < Number(shares) ? { filled, of: Number(shares) } : null,
+      contracts: contractsNow,
+      note: readBackError,
+    });
   }));
 
   /*
@@ -529,6 +547,14 @@ function mount(r) {
               'resolve with filledShares no larger than the position');
           }
         } else {
+          // The same rule at the fill: a second open contract in one symbol
+          // is refused even if a POSTED leg slipped through earlier.
+          const already = await positions.openBuy(leg.symbol, client);
+          if (already && Number(already.id) !== Number(leg.id)) {
+            throw refused(`${leg.symbol} already has an open position (contract ${already.contract_seq}, ` +
+              `${already.remaining_shares.toLocaleString('en-US')} held) — this fill would open a second one`,
+              'cancel this leg (status CANCELLED) or sell the position first');
+          }
           await assertPositionRoom(client, { exceptSymbol: leg.symbol, day: d });
         }
         const premier = await positions.isPremier(leg.symbol, client);

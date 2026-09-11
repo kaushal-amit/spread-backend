@@ -118,11 +118,11 @@ function bind(pool) {
         `INSERT INTO public.symbol_day (symbol, trading_date, open_px, high_px, low_px, close_px, prev_close,
            total_volume, trades, data_quality, source, avg_spread_pct, days_active, uptick_ratio, range_source,
            avg_trade_size, moves, up_moves_2plus, tiny_pct_up, buy_sell_ratio, coverage_pct, day_range, chg_fils)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'test',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'AWSAT',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
          ON CONFLICT DO NOTHING`,
         [sym, day, row.open ?? 200, row.high ?? 202, row.low ?? 199, row.close ?? 201, row.prevClose ?? 200,
          row.volume ?? 1000, row.trades ?? 10, row.dataQuality ?? 'FULL', row.avgSpreadPct ?? 0.5,
-         row.daysActive ?? 1, row.uptickRatio ?? 1, row.rangeSource ?? 'quotes',
+         row.daysActive ?? 1, row.uptickRatio ?? 1, row.rangeSource ?? 'FULL',
          row.avgTradeSize ?? null, row.moves ?? null, row.upMoves2plus ?? null, row.tinyPctUp ?? null,
          row.buySellRatio ?? null, row.coveragePct ?? null, row.dayRange ?? null, row.chgFils ?? null]);
     },
@@ -258,9 +258,12 @@ function bind(pool) {
     depthSlot: (sym, { slotNo, day, at = new Date() } = {}) => {
       assertTestSymbol(sym);
       return pool.query(
+        // The scraper's CHECK (024): PRE_DAY is slots 1–3, WAKEUP 4–8. Derived
+        // from the slot number so a caller cannot write a pair the shared
+        // database refuses (the old literal 'swappable' failed with 23514).
         `INSERT INTO public.depth_watchlist (trading_date, slot_no, symbol, slot_type, assigned_at, assigned_by)
-         VALUES ($1::date,$2,$3,'swappable',$4,'test')`,
-        [day, slotNo, sym, at]);
+         VALUES ($1::date,$2,$3,$5,$4,'test')`,
+        [day, slotNo, sym, at, slotNo <= 3 ? 'PRE_DAY' : 'WAKEUP']);
     },
     clearDepthSlots: (day) => pool.query('DELETE FROM public.depth_watchlist WHERE trading_date = $1::date', [day]),
     clearSymbolDay: (sym) => { assertTestSymbol(sym); return pool.query('DELETE FROM public.symbol_day WHERE symbol = $1', [sym]); },
@@ -305,7 +308,11 @@ function bind(pool) {
                problem = EXCLUDED.problem, last_seen_at = EXCLUDED.last_seen_at;`,
         [script, version, rowsSeen, problem, String(secondsAgo)]);
     },
-    clearHeartbeats: () => pool.query("DELETE FROM public.client_heartbeat WHERE source = 'test'")
+    // Every row, not only source='test': the scraper's own suite runs against
+    // the same *_test database and leaves awsat_client rows for all four
+    // scripts, which made "quotes is absent" read ok. The guard already
+    // confines this to a *_test database.
+    clearHeartbeats: () => pool.query('DELETE FROM public.client_heartbeat')
       .catch(() => {}),
 
     /** public.signal_log / public.position — the review surface's sources. */

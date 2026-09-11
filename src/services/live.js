@@ -34,7 +34,7 @@ async function fillTime(symbol, { budgetKd, db = pool, cfg = QUALITY } = {}) {
        SELECT volume::bigint AS vol, bid::numeric AS bid, bid_qty::bigint AS bid_shares,
               created_at
          FROM spread.v_quote_screening
-        WHERE upper(symbol) = $1 AND created_at >= now() - ($2 || ' minutes')::interval
+        WHERE symbol = upper($1) AND created_at >= now() - ($2 || ' minutes')::interval
         ORDER BY created_at)
      SELECT (SELECT max(vol) - min(vol) FROM w)                        AS traded,
             (SELECT count(*) FROM w)                                   AS ticks,
@@ -94,7 +94,7 @@ async function wakeUpScan(tradingDay, { db = pool, cfg = WAKE, now = new Date() 
     `WITH today AS (
        SELECT symbol, max(trades::bigint) AS trades_so_far
          FROM spread.v_quote_screening
-        WHERE spread.kuwait_day(created_at) = $1
+        WHERE trading_date = $1::date
         GROUP BY symbol)
      SELECT t.symbol, t.trades_so_far, p.${col} AS baseline,
             round(t.trades_so_far::numeric / p.${col}, 2) AS pace_ratio,
@@ -141,7 +141,7 @@ async function aliveCheck(symbol, tradingDay, { db = pool, now = new Date() } = 
 
   const { rows: [t] } = await db.query(
     `SELECT max(trades::bigint) AS n FROM spread.v_quote_screening
-      WHERE upper(symbol) = $1 AND spread.kuwait_day(created_at) = $2;`, [sym, tradingDay]);
+      WHERE symbol = upper($1) AND trading_date = $2::date;`, [sym, tradingDay]);
 
   const baseline = Number(
     hour <= 9 ? p.median_trades_by_0930
@@ -180,7 +180,7 @@ async function costOfWaiting(symbol, { entryFils, shares, offerFils, sinceMins =
     `WITH w AS (
        SELECT bid::numeric AS bid, offer_qty::bigint AS offer_shares, created_at
          FROM spread.v_quote_screening
-        WHERE upper(symbol) = $1 AND created_at >= now() - ($2 || ' minutes')::interval
+        WHERE symbol = upper($1) AND created_at >= now() - ($2 || ' minutes')::interval
         ORDER BY created_at)
      SELECT (SELECT bid FROM w ORDER BY created_at DESC LIMIT 1) AS bid_now,
             (SELECT bid FROM w ORDER BY created_at ASC  LIMIT 1) AS bid_then,
@@ -223,7 +223,7 @@ async function tinyAtPrice(symbol, priceFils, tradingDay, { db = pool, tinyMax =
        SELECT created_at, last_price::numeric AS px, last_qty::bigint AS one_trade,
               lag(last_price::numeric) OVER (ORDER BY created_at) AS prev_px
          FROM spread.v_quote_screening
-        WHERE upper(symbol) = $1 AND spread.kuwait_day(created_at) = $2
+        WHERE symbol = upper($1) AND trading_date = $2::date
      ), moves AS (
        SELECT * FROM t WHERE prev_px IS NOT NULL AND px <> prev_px
      )

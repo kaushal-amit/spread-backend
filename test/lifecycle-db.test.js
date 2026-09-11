@@ -79,6 +79,17 @@ process.env.SPREAD_TEST_NOW = `${DAY}T07:00:00Z`;
     const a1 = await post('/trading/record', { symbol: A, side: 'BUY', status: 'FILLED', priceFils: 200, shares: 1000 });
     chk('a filled buy in A — the claimed symbol — is allowed', a1.status === 200 && a1.body.ok, a1.body);
 
+    console.log('\n=== one open position per symbol — at the POST, not only at the fill ===');
+    // Holding A (filled above). A POSTED BUY in A used to be accepted, and
+    // resolving it FILLED opened a SECOND contract in the same stock.
+    // (the clock is frozen at 10:00 Kuwait for the whole suite — inside the session,
+    // so the refusal below is the position rule, not the flat-by clock)
+    const dbl = await post('/trading/record', { symbol: A, side: 'BUY', status: 'POSTED', priceFils: 199, shares: 1000 });
+    chk('a POSTED BUY while holding the symbol is REFUSED', dbl.status === 409 && /already has an open position/.test(dbl.body.error || ''), dbl.body);
+    chk('  naming the contract held', /contract 1/.test(dbl.body.error || ''), dbl.body.error);
+    const openA = (await legs(A)).filter((l) => l.side === 'BUY' && ['FILLED', 'CARRIED', 'POSTED'].includes(l.status));
+    chk('  and only ONE buy leg exists in A', openA.length === 1, openA.map((l) => [l.status, l.contract_seq]));
+
     console.log('\n=== untrade is a soft delete ===');
     const u = await post('/trading/untrade', { symbol: A });
     chk('the claim is released', u.status === 200 && u.body.released === true && u.body.releasedKd === 500, u.body);

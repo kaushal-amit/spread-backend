@@ -97,6 +97,19 @@ const at = (day, hhmm) => new Date(`${day}T${hhmm}:00+03:00`);
     chk('healthy breadth before 12:45 → can open', before.canOpen && before.mode === 'trade', [before.mode, before.reasons]);
     const after = await stops.evaluate(day, { now: at(day, '12:50') });
     chk('after 12:45 → flat, no new position', !after.canOpen && after.pastFlatBy && /12:45/.test(after.reasons.join(' ')), after.reasons);
+    // No evening exception: 16:00–24:00 used to re-open the day (pastFlatBy
+    // was bounded at 16:00 and a null phase meant "evaluate").
+    const evening = await stops.evaluate(day, { now: at(day, '16:53') });
+    chk('16:53 → closed, cannot open', evening.canOpen === false && evening.closed === true && evening.mode === 'closed', [evening.mode, evening.reasons]);
+    const night = await stops.evaluate(day, { now: at(day, '23:30') });
+    chk('23:30 → closed, cannot open', night.canOpen === false && night.mode === 'closed', [night.mode]);
+    const friday = '2026-09-11', saturday = '2026-09-12';
+    const fri = await stops.evaluate(friday, { now: at(friday, '10:00') });
+    chk('Friday 10:00 → closed, "Friday — no session"', fri.canOpen === false && fri.mode === 'closed' && /Friday/.test(fri.reasons.join(' ')), fri.reasons);
+    const sat = await stops.evaluate(saturday, { now: at(saturday, '10:00') });
+    chk('Saturday 10:00 → closed', sat.canOpen === false && /Saturday/.test(sat.reasons.join(' ')), sat.reasons);
+    chk('isWeekend: Fri/Sat yes, Sun–Thu no',
+      stops.isWeekend(friday) && stops.isWeekend(saturday) && !stops.isWeekend('2026-09-13') && !stops.isWeekend('2026-09-10'));
     await fx.clearMarketSummary('SZTESTSTOP');
 
     console.log('\n=== enforcement through the trading routes ===');
@@ -113,10 +126,20 @@ const at = (day, hhmm) => new Date(`${day}T${hhmm}:00+03:00`);
 
     const SYM = 'SZTESTSTOPQ';
     await fx.clearLegs(SYM); await fx.instrument(SYM);
-    // Force a stop: breadth 24% now.
+    // The clock is frozen inside the session (11:00 Kuwait on `day`): outside
+    // it the day is CLOSED and the refusal names the close, not the breadth —
+    // which is the rule, and would make this proof depend on when it is run.
+    // The routes take the day from the wall clock, so on a Friday/Saturday the
+    // weekend rule closes it regardless; that case is proven in sessionclose.
+    const now1100 = at(day, '11:00');
+    process.env.SPREAD_TEST_NOW = now1100.toISOString();
+    // Force a stop: breadth 24% for the last 10 minutes.
     for (let i = 0; i < 10; i++) {
-      await fx.marketSummary(day, new Date(Date.now() - (9 - i) * 60000), { advancing: 24, declining: 60, unchanged: 16, batch: 'SZTESTSTOP' });
+      await fx.marketSummary(day, new Date(now1100.getTime() - (9 - i) * 60000), { advancing: 24, declining: 60, unchanged: 16, batch: 'SZTESTSTOP' });
     }
+    if (stops.isWeekend(day)) {
+      console.log('  SKIP  today is a Friday/Saturday — the routes read the wall-clock day and the weekend rule closes it');
+    } else {
     const claim = await post('/trading/move', { symbol: SYM, amountKd: 500 });
     chk('a claim is refused under a stop', claim.status === 409 && /no new position/.test(claim.body.error), claim.body);
     const posted = await post('/trading/record', { symbol: SYM, side: 'BUY', status: 'POSTED', priceFils: 200, shares: 1000 });
@@ -126,6 +149,8 @@ const at = (day, hhmm) => new Date(`${day}T${hhmm}:00+03:00`);
     chk('  and flagged as a breach', filled.body.ruleBreach && /24/.test(filled.body.warning), filled.body.ruleBreach);
     const { rows: ev } = await pool.query("SELECT * FROM spread.event_log WHERE symbol = $1 AND action = 'STOP_BREACHED'", [SYM]);
     chk('  and recorded in event_log', ev.length === 1, ev.length);
+    }
+    delete process.env.SPREAD_TEST_NOW;
 
     await fx.clearMarketSummary('SZTESTSTOP');
     await fx.clearLegs(SYM); await pool.query('DELETE FROM spread.event_log WHERE symbol = $1', [SYM]);

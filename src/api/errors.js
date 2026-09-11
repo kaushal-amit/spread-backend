@@ -50,6 +50,15 @@ function toResponse(err) {
    * A raw Postgres error carries column names, SQL fragments and sometimes
    * parameter values, and the client's retry policy needs none of them.
    */
+  // body-parser: malformed JSON and an oversized body are the CLIENT's error
+  // (400 / 413), not a 500 INTERNAL — which is what they became when
+  // err.status/err.type were ignored, and what told a retry loop to retry.
+  if (err?.type === 'entity.too.large' || err?.status === 413) {
+    return { status: 413, body: { error: 'request body too large', detail: err.limit ? `limit ${err.limit} bytes` : null, code: 'PAYLOAD_TOO_LARGE' } };
+  }
+  if (err?.type === 'entity.parse.failed' || (err instanceof SyntaxError && err?.status === 400)) {
+    return { status: 400, body: { error: 'malformed JSON body', detail: null, code: 'BAD_REQUEST' } };
+  }
   const pg = PG[err?.code];
   if (pg) {
     return { status: 503, body: { error: pg[1], detail: `postgres ${err.code}`, code: pg[0] } };

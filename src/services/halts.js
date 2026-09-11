@@ -129,6 +129,32 @@ function verdict({ direction, resumePrice, bidQty, offerQty, budgetKd, skipReaso
   const price = Number(resumePrice);
   const myPctMax = Number(t.my_pct_max ?? 30);
   const ratioMax = Number(t.halt_offer_over_bid_max ?? 3);
+
+  // H-V1 · A GATE WITHOUT A NUMBER IS NOT COMPUTED, never a verdict.
+  //
+  // Number(null) is 0, and 0 passes every comparison below: a resume with no
+  // book captured read "TRADEABLE · bid 0 · you 5,300 = null% · offer 0×" and
+  // went to the phone as a trade. A null direction (no print five minutes
+  // before the halt, or no paired HALT row) read "UP HALT — SKIP", a direction
+  // nobody measured. Each missing input is named so the operator knows WHICH
+  // capture failed. Not TRADEABLE, not audible — but still delivered as a
+  // one-line reject (whatsapp.sendResume): a halt the operator does not hear
+  // about is the failure the detector exists to stop.
+  const missing = [];
+  if (direction == null) missing.push('no direction — no print in the 5 minutes before the halt, or no paired HALT');
+  if (!(price > 0)) missing.push('no resume price');
+  if (bidQty == null || offerQty == null) missing.push('no book captured');
+  else if (!(Number(bidQty) > 0) && !(Number(offerQty) > 0)) missing.push('empty book — bid 0, offer 0');
+  if (missing.length) {
+    return {
+      verdict: 'NOT COMPUTED', verdictDetail: missing.join('; '), notComputed: true, missing,
+      direction: direction ?? null, resumePrice: price > 0 ? price : null,
+      yourShares: null, yourPctBid: null, exitMultiple: null, offerOverBid: null, halved: false,
+      targetFils: price > 0 ? price + Number(t.halt_target_fils) : null,
+      stopFils: price > 0 ? price - Number(t.halt_stop_fils) : null,
+      tradeable: false,
+    };
+  }
   // G-4 · gates 1–7 do not need the budget; only sizing and the exit gate do.
   // With no session budget set, the size is NULL — never a fallback number — and
   // the verdict is NO BUDGET SET rather than TRADEABLE or a silent skip.
@@ -163,6 +189,11 @@ function verdict({ direction, resumePrice, bidQty, offerQty, budgetKd, skipReaso
     v = 'SECOND HALT — CASCADE'; detail = `halt #${Number(haltCountToday) + 1} for this symbol today — a re-halt is a cascade, not a bounce`;
   } else if (skipReason) {
     v = 'WARN'; detail = `skip list — ${skipReason}`;
+  } else if (!(Number(bidQty) > 0)) {
+    // CR-1 · a captured book with nothing on the bid is a measurement, not a
+    // missing input: there is no queue to join. Distinct from NOT COMPUTED
+    // (no capture at all) above.
+    v = 'NO BID'; detail = `touch bid is 0 with ${num(offerQty)} offered — nothing to post behind`;
   } else if (Number(bidQty) >= Number(t.halt_book_too_deep_qty)) {
     v = 'BOOK TOO DEEP'; detail = `touch bid ${num(bidQty)} is at/over ${num(t.halt_book_too_deep_qty)} — you cannot get filled ahead of it`;
   } else if (offerOverBid != null && Number(offerQty) > ratioMax * Number(bidQty)) {
@@ -182,7 +213,7 @@ function verdict({ direction, resumePrice, bidQty, offerQty, budgetKd, skipReaso
   } else {
     v = 'TRADEABLE'; detail = `bid ${num(bidQty)} · you ${num(shares)} = ${yourPctBid}%${halved ? ' (halved)' : ''} · offer ${exitMultiple}×`;
   }
-  return { verdict: v, verdictDetail: detail, direction, resumePrice: price, yourShares: shares,
+  return { verdict: v, verdictDetail: detail, notComputed: false, missing: [], direction, resumePrice: price, yourShares: shares,
     yourPctBid, exitMultiple, offerOverBid, halved, targetFils: target, stopFils: stop, tradeable: v === 'TRADEABLE' };
 }
 
@@ -191,7 +222,7 @@ async function priceBefore(symbol, tradingDay, at, windowMins, db = pool) {
   const cutoff = new Date(new Date(at).getTime() - windowMins * 60000);
   const { rows: [r] } = await db.query(
     `SELECT last_price FROM public.awsat_market_quotes
-      WHERE upper(symbol) = upper($1) AND trading_date = $2 AND created_at <= $3 AND last_price IS NOT NULL
+      WHERE symbol = upper($1) AND trading_date = $2 AND created_at <= $3 AND last_price IS NOT NULL
       ORDER BY created_at DESC LIMIT 1;`, [symbol, tradingDay, cutoff]);
   return r ? Number(r.last_price) : null;
 }
@@ -200,7 +231,7 @@ async function priceBefore(symbol, tradingDay, at, windowMins, db = pool) {
 async function priorClose(symbol, tradingDay, db = pool) {
   const { rows: [r] } = await db.query(
     `SELECT close_px FROM public.symbol_day
-      WHERE upper(symbol) = upper($1) AND trading_date < $2 AND close_px IS NOT NULL
+      WHERE symbol = upper($1) AND trading_date < $2 AND close_px IS NOT NULL
       ORDER BY trading_date DESC LIMIT 1;`, [symbol, tradingDay]);
   return r ? Number(r.close_px) : null;
 }
@@ -215,12 +246,14 @@ function payload({ id, symbol, at, vd, bidQty, offerQty, bandRefFils, history: h
     id, symbol, at: new Date(at).toISOString(),
     direction: vd.direction,
     resumePriceFils: vd.resumePrice,
-    touchBidQty: Number(bidQty), touchOfferQty: Number(offerQty),
+    // null stays null: Number(null) is 0, and 0 is a measurement.
+    touchBidQty: bidQty == null ? null : Number(bidQty), touchOfferQty: offerQty == null ? null : Number(offerQty),
     bandRefFils,                       // ceil(prev_close × 0.95) — a reference, NOT a floor
     yourShares: vd.yourShares, yourPctBid: vd.yourPctBid,
     exitMultiple: vd.exitMultiple, offerOverBid: vd.offerOverBid, halved: vd.halved,
     targetFils: vd.targetFils, stopFils: vd.stopFils,
     verdict: vd.verdict, verdictDetail: vd.verdictDetail, tradeable: vd.tradeable,
+    notComputed: vd.notComputed === true, missing: vd.missing || [],
     symbolHistory: { halts: hist.halts, reached5Fils: hist.reached5Fils ?? hist.gave5,
       avgFils: hist.avgFils ?? hist.avgGain, gave5: hist.gave5, avgGain: hist.avgGain },
     // legacy field names some callers/tests read
@@ -292,10 +325,10 @@ async function slotSwapDecision(symbol, tradingDay, db = pool) {
   const syms = displaceable.map((s) => s.symbol);
   const cap = await require('./slots').staleMin(db);
   const { rows: capRows } = await db.query(
-    `SELECT upper(symbol) AS sym, max(captured_at) AS last_capture
+    `SELECT symbol AS sym, max(captured_at) AS last_capture
        FROM public.awsat_stock_depth
-      WHERE trading_date = $1 AND upper(symbol) = ANY($2)
-      GROUP BY upper(symbol);`, [tradingDay, syms.map((s) => String(s).toUpperCase())]);
+      WHERE trading_date = $1 AND symbol = ANY($2)
+      GROUP BY symbol;`, [tradingDay, syms.map((s) => String(s).toUpperCase())]);
   const captureBy = new Map(capRows.map((c) => [c.sym, c.last_capture ? new Date(c.last_capture).getTime() : null]));
   const { rows: activity } = await db.query(
     `SELECT DISTINCT ON (symbol) symbol, COALESCE(trades, 0) AS trades
@@ -433,6 +466,13 @@ async function poll(tradingDay, { db = pool, budgetKd = require('../config/sprea
   }
 
   const events = transitions(sessions, now);
+  // RESUMES FIRST. A HALT applies its slot swap synchronously (a POST to the
+  // scraper, up to 5 s, twice on a 409); with several halts in one tick a
+  // RESUME later in the list waited behind them, inside a 2-minute window
+  // where the edge halves in the first 60 s. The resume is the trade; the
+  // swap is preparation for a later one.
+  const ORDER = { RESUME: 0, NO_RESUME: 1, HALT: 2 };
+  events.sort((a, b) => (ORDER[a.kind] ?? 9) - (ORDER[b.kind] ?? 9));
   const halts = [];
   const resumes = [];
   const noResumes = [];

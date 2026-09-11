@@ -62,8 +62,20 @@ function watchedSymbols() {
  * until you can watch lastSuccessAt stop advancing. `scannerHealth()` exposes it.
  */
 const _scannerHealth = {};
+/**
+ * lastSuccessAt  the last run that completed WITHOUT throwing
+ * lastWorkAt     the last run that did its work (an early return — market
+ *                closed, nobody in the room, not the scheduled minute — is
+ *                `idle`, and idle must not read as "fresh": a scanner that
+ *                returned early every tick since 09:00 looked alive on /health)
+ * lastError      the last throw. The scanners used to swallow their own
+ *                errors with a warn line, so this was never set and a scanner
+ *                failing every tick since boot showed lastSuccessAt advancing.
+ *                They rethrow now; this is the one place that logs and records.
+ */
 function scanner(name, fn) {
-  const h = _scannerHealth[name] = { lastSuccessAt: null, lastError: null, runs: 0, skipped: 0, running: false };
+  const h = _scannerHealth[name] = { lastSuccessAt: null, lastWorkAt: null, lastError: null, lastErrorAt: null,
+    runs: 0, idle: 0, errors: 0, skipped: 0, running: false };
   return async (...args) => {
     if (h.running) {
       h.skipped += 1;
@@ -77,15 +89,18 @@ function scanner(name, fn) {
     if (h.skipped) { log.info(`[${name}] caught up after skipping ${h.skipped} tick(s)`); h.skipped = 0; }
     h.running = true;
     try {
-      await fn(...args);
-      h.lastSuccessAt = new Date().toISOString();
+      const r = await fn(...args);
+      const now = new Date().toISOString();
+      h.lastSuccessAt = now;
+      if (r === 'idle') h.idle += 1; else h.lastWorkAt = now;
       h.lastError = null;
       h.runs += 1;
     } catch (e) {
-      // The scanners already try/catch internally, so reaching here is unusual;
-      // record it anyway — a scanner that throws every tick must be visible.
       h.lastError = e && e.message ? e.message : String(e);
-      log.warn(`[${name}] scan threw`, h.lastError);
+      h.lastErrorAt = new Date().toISOString();
+      h.errors += 1;
+      // Coalesced like the overrun warning: the first, then every 15th.
+      if (h.errors === 1 || h.errors % 15 === 0) log.warn(`[${name}] scan failed (${h.errors} so far)`, h.lastError);
     } finally {
       h.running = false;
     }
@@ -95,8 +110,8 @@ function scanner(name, fn) {
 function scannerHealth() {
   const out = {};
   for (const [k, v] of Object.entries(_scannerHealth)) {
-    out[k] = { lastSuccessAt: v.lastSuccessAt, runs: v.runs, skipped: v.skipped,
-      running: v.running, lastError: v.lastError };
+    out[k] = { lastSuccessAt: v.lastSuccessAt, lastWorkAt: v.lastWorkAt, runs: v.runs, idle: v.idle,
+      errors: v.errors, skipped: v.skipped, running: v.running, lastError: v.lastError, lastErrorAt: v.lastErrorAt };
   }
   return out;
 }
@@ -131,6 +146,13 @@ function registerHandlers(io) {
     let day = daily.kuwaitDay();
     let budgetKd = require('./services/gateStore').sessionBudgetKd();
     socket.join(room(day));
+    // Which room this socket FOLLOWS: today's, unless it subscribed to a date
+    // of its own. The ticker moves every follower of "today" into the new
+    // day's room at the 04:00 Kuwait rollover (followDay below) — a socket
+    // that stayed connected overnight used to sit in yesterday's room and
+    // receive nothing, no update, no halt alert, until a reload.
+    socket.data.followsToday = true;
+    socket.data.day = day;
 
     /* The detail panel tells us which book it is showing. */
     watchedBySocket.set(socket.id, new Set());
@@ -164,6 +186,9 @@ function registerHandlers(io) {
       socket.leave(room(day));
       day = d; budgetKd = b;
       socket.join(room(day));
+      // An explicit date is a choice; a subscribe to today keeps following it.
+      socket.data.followsToday = d === daily.kuwaitDay();
+      socket.data.day = day;
       socket.emit('spread:update', await view(day, budgetKd));
     });
 
@@ -183,11 +208,27 @@ async function view(day, budgetKd) {
    * PUT /gates the socket and the REST routes disagreed about which stocks
    * passed. routes.board() applies the stored overrides and caches for one
    * tick; both paths now read it.
+   *
+   * §0 · EMPTY IS NOT BROKEN. When the screen throws, this used to emit an
+   * empty board with no error — the terminal read "0 symbols · live · nothing
+   * passes every gate", a quiet market, while the database was down. And with
+   * no session budget it passed null through, which rejected every stock
+   * "above the 0-fil ceiling for null KD" where REST answers 503 NOT_READY.
+   * Now the payload carries `error` + `code` and the buckets stay empty; the
+   * client renders BROKEN, never a clean board.
    */
-  const screen = await require('./api/routes').board(day, budgetKd).catch((e) => {
-    log.warn('[socket] screen:', e.message);
-    return { recommended: [], nearMiss: [], rejected: [], counts: {}, reach: null };
-  });
+  let boardError = null;
+  let screen;
+  if (budgetKd == null) {
+    boardError = { code: 'NOT_READY', error: 'no session budget is set — set it with PUT /gates {"session-budget": …}' };
+    screen = { recommended: [], nearMiss: [], rejected: [], notComputed: [], counts: {}, reach: null };
+  } else {
+    screen = await require('./api/routes').board(day, budgetKd).catch((e) => {
+      log.warn('[socket] screen:', e.message);
+      boardError = { code: e.code || 'BOARD_FAILED', error: 'the board could not be computed — see the server log' };
+      return { recommended: [], nearMiss: [], rejected: [], notComputed: [], counts: {}, reach: null };
+    });
+  }
   const { rows: [cov] } = await pool.query(
     'SELECT * FROM spread.market_day WHERE trading_day = $1;', [day]).catch(() => ({ rows: [] }));
 
@@ -199,6 +240,9 @@ async function view(day, budgetKd) {
   const present = require('./api/present');
   return {
     tradingDay: day, budgetKd,
+    // null when the board computed; { code, error } when it did not. A client
+    // that sees this must not render the empty buckets as a quiet market.
+    error: boardError,
     recommended: screen.recommended.map((x) => present.stockCandidate(x, budgetKd)),
     nearMiss: screen.nearMiss.map((x) => present.stockCandidate(x, budgetKd)),
     rejected: screen.rejected.map((x) => present.stockCandidate(x, budgetKd)),
@@ -349,11 +393,31 @@ async function ruleAlerts(day, io) {
   }
 }
 
+/**
+ * Move every socket that follows "today" into today's room. Called from the
+ * ticker; cheap (one pass over the connected sockets) and a no-op except on
+ * the first tick after the 04:00 Kuwait rollover. Returns how many moved.
+ */
+function followDay(io, day) {
+  let moved = 0;
+  for (const [, socket] of io.sockets.sockets) {
+    if (!socket.data || !socket.data.followsToday || socket.data.day === day) continue;
+    socket.leave(room(socket.data.day));
+    socket.join(room(day));
+    socket.data.day = day;
+    socket.emit('spread:day', { day });
+    moved += 1;
+  }
+  if (moved) log.info(`[tick] day rolled to ${day} — ${moved} socket(s) moved to the new room`);
+  return moved;
+}
+
 function startTicker(io, ms = TICK_MS) {
   return setInterval(scanner('tick', async () => {
     const day = daily.kuwaitDay();
+    followDay(io, day);
     const r = room(day);
-    if (!io.sockets.adapter.rooms.get(r)) return;
+    if (!io.sockets.adapter.rooms.get(r)) return 'idle';
     try {
       const v = await view(day, require('./services/gateStore').sessionBudgetKd());
       io.to(r).emit('spread:update', v);
@@ -404,7 +468,7 @@ function startTicker(io, ms = TICK_MS) {
       // Only while the market is open. A 12:30 flatten alert once fired at
       // 19:55 because nothing asked the clock first.
       if (sessionPhase().open) await ruleAlerts(day, io);
-    } catch (e) { log.warn('[tick]', e.message); }
+    } catch (e) { throw e; } // recorded and logged by scanner()
   }), ms);
 }
 
@@ -435,7 +499,7 @@ function startRowPoller(io, { everyMs = POLL_MS } = {}) {
   return setInterval(scanner('rowPoller', async () => {
     const day = daily.kuwaitDay();
     const r = room(day);
-    if (!io.sockets.adapter.rooms.get(r)) return;
+    if (!io.sockets.adapter.rooms.get(r)) return 'idle';
 
     try {
       if (seeding) {
@@ -444,9 +508,18 @@ function startRowPoller(io, { everyMs = POLL_MS } = {}) {
                  (SELECT max(id) FROM public.signal_log)    AS signal,
                  (SELECT max(id) FROM public.position)      AS position,
                  (SELECT max(computed_at) FROM public.market_day) AS market`);
-        Object.assign(seen, rows[0]);
+        // A table that is EMPTY at boot seeds null, and every consumer below
+        // guards `seen.x !== null` — so that stream never emitted until the
+        // next restart. An empty table means "from the beginning": seed the
+        // id streams at 0 and the time streams at the epoch.
+        Object.assign(seen, {
+          minute: rows[0].minute ?? new Date(0),
+          signal: rows[0].signal ?? 0,
+          position: rows[0].position ?? 0,
+          market: rows[0].market ?? new Date(0),
+        });
         seeding = false;
-        return;
+        return 'idle';
       }
 
       // symbol_minute -> only the sockets watching that symbol. A trader with
@@ -510,7 +583,7 @@ function startWakeupScanner(io, { times = WAKE_TIMES, everyMs = 60000 } = {}) {
       const hhmm = `${String(k.getUTCHours()).padStart(2, '0')}:${String(k.getUTCMinutes()).padStart(2, '0')}`;
       const day = daily.kuwaitDay();
       const key = `${day} ${hhmm}`;
-      if (!times.includes(hhmm) || fired.has(key)) return;
+      if (!times.includes(hhmm) || fired.has(key)) return 'idle';
       fired.add(key);
 
       const flagged = await live.wakeUpScan(day);
@@ -518,7 +591,7 @@ function startWakeupScanner(io, { times = WAKE_TIMES, everyMs = 60000 } = {}) {
         // Most stocks have barely traded by 09:30 and the ratios are unstable.
         lowConfidence: hhmm === '09:30' });
       log.info(`[wakeup] ${hhmm}: ${flagged.length} flagged`);
-    } catch (e) { log.warn('[wakeup]', e.message); }
+    } catch (e) { throw e; } // recorded and logged by scanner()
   }), everyMs);
 }
 
@@ -548,7 +621,7 @@ function startAlertScanner(io, { everyMs = 60000 } = {}) {
       // their duration is recorded rather than left dangling to tomorrow.
       for (const [, o] of open) await alerts.closeWindow(o.alertId).catch(() => {});
       open.clear();
-      return;
+      return 'idle';
     }
     const day = daily.kuwaitDay();
     try {
@@ -602,7 +675,7 @@ function startAlertScanner(io, { everyMs = 60000 } = {}) {
         open.delete(key);
         io.to(room(day)).emit('spread:entryAlertClosed', { alertId: o.alertId });
       }
-    } catch (e) { log.warn('[alert]', e.message); }
+    } catch (e) { throw e; } // recorded and logged by scanner()
   }), everyMs);
 }
 
@@ -620,10 +693,16 @@ function startAlertScanner(io, { everyMs = 60000 } = {}) {
 function startHaltScanner(io, { everyMs = 20000 } = {}) {
   const sessions = new Map();
   let seeded = false;
+  let sessionsDay = null;
   return setInterval(scanner('halt', async () => {
     const phase = sessionPhase();
-    if (!phase.open) return;
+    if (!phase.open) return 'idle';
     const day = daily.kuwaitDay();
+    // The map is a cache of TODAY's table. Carried across the day rollover, a
+    // symbol left in CB Auction at yesterday's close read as a RESUME on the
+    // first tick of the next session — a halt that never happened, with a
+    // verdict. New day, empty map, re-seeded from the table (G-7).
+    if (sessionsDay !== day) { sessions.clear(); seeded = false; sessionsDay = day; }
     try {
       const budgetKd = require('./services/gateStore').sessionBudgetKd();
       // G-7 · on the first tick after a (re)start, rebuild the session map from
@@ -663,7 +742,10 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
         // configured: with none, send() logs the exact line it WOULD have sent
         // and the row records channel 'console' with the reason — nothing silent.
         // Bounded and never throwing; a real failure raises to the terminal.
-        if (res.tradeable) {
+        // TRADEABLE goes out as the trade; NOT COMPUTED goes out as a one-line
+        // reject naming the missing input. Every other verdict stays on the
+        // feed only (whatsapp.shouldDeliver).
+        if (whatsapp.shouldDeliver(res)) {
           whatsapp.sendResume(res).then(async (wr) => {
             const channel = wr.provider || 'console';
             const err = wr.ok ? null
@@ -692,7 +774,7 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
       for (const s of stale) {
         io.to(roomId).emit('spread:slotStale', { slot: s.slot, symbol: s.symbol, lastCaptureAt: s.lastCaptureAt });
       }
-    } catch (e) { log.warn('[halt]', e.message); }
+    } catch (e) { throw e; } // recorded and logged by scanner()
   }), everyMs);
 }
 
@@ -709,15 +791,15 @@ function startHaltScanner(io, { everyMs = 20000 } = {}) {
 function startFeedHealthScanner(io, { everyMs = 120000 } = {}) {
   const feedHealth = require('./services/feedHealth');
   return setInterval(scanner('feedHealth', async () => {
-    if (!sessionPhase().open) return;
+    if (!sessionPhase().open) return 'idle';
     const day = daily.kuwaitDay();
     try {
       const r = await feedHealth.check(day);
       if (r.available) io.to(room(day)).emit('spread:feedHealth', await feedHealth.roster());
-    } catch (e) { log.warn('[feedHealth]', e.message); }
+    } catch (e) { throw e; } // recorded and logged by scanner()
   }), everyMs);
 }
 
-module.exports = { registerHandlers, startTicker, startWakeupScanner, startAlertScanner,
+module.exports = { registerHandlers, startTicker, startWakeupScanner, startAlertScanner, followDay,
   ruleAlerts, sessionPhase, view, watchedSymbols, watchedBySocket, startRowPoller, announceStops,
   startHaltScanner, startFeedHealthScanner, scannerHealth, scanner };

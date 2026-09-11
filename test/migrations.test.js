@@ -61,7 +61,10 @@ for (const f of files) {
   if (f === '010_repoint_to_kse.sql' || f === '011_symbol_day_reads_public.sql'
       || f === '015_drop_duplicates.sql' || f === '016_gate_stats_bridge.sql'
       || f === '017_trading_constraints.sql' || f === '018_gate5_blended_tape.sql'
-      || f === '019_kuwait_day.sql' || f === '020_session_stops.sql' || f === '021_bid_age_stop.sql') {
+      || f === '019_kuwait_day.sql' || f === '020_session_stops.sql' || f === '021_bid_age_stop.sql'
+      // 038 recreates v_depth with DROP ... CASCADE over public.awsat_stock_depth —
+      // real Postgres only, like 010; the view is exercised in ladder/bidage/halts.
+      || f === '038_v_depth_day_key.sql') {
     chk(f + '  skipped here — needs real Postgres and public.* tables',
        true, 'verified in views.test.js against a kse-shaped database');
     continue;

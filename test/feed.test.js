@@ -69,12 +69,37 @@ const SYM = 'SZTESTFEED';
     await fx.heartbeat('orders', { secondsAgo: 4000, rowsSeen: 0 });   // silent
     await fx.heartbeat('depth', { secondsAgo: 5, rowsSeen: 42 });      // ok
     // quotes + market-summary never check in → absent
-    const ros = await feedHealth.roster({ maxAgeSec: 300 });
+    const ros = await feedHealth.roster({ maxAgeSec: 300, inSession: false }); // liveness only — the in-session rules are proven below
     const st = Object.fromEntries(ros.scripts.map((s) => [s.script, s.status]));
     chk('table present → available', ros.available === true, ros);
     chk('orders is silent', st.orders === 'silent', st);
     chk('depth is ok', st.depth === 'ok', st);
     chk('quotes is absent (never checked in)', st.quotes === 'absent', st);
+
+    console.log('\n=== H9 · a check-in is not a delivery: degraded ===');
+    const F = (r, o) => feedHealth.feedStatus(r, { maxAgeSec: 300, inSession: true, ...o }).status;
+    chk('feedStatus mirrors the scraper: absent / silent / ok',
+      F(null) === 'absent' && F({ silent_sec: 900, rows_seen: 5 }) === 'silent'
+      && F({ silent_sec: 10, rows_seen: 5, submission_sec: 20, has_submission_clock: true }) === 'ok');
+    chk('a problem string → degraded, any hour',
+      F({ silent_sec: 10, rows_seen: 5, submission_sec: 20, has_submission_clock: true, problem: 'no grid' }) === 'degraded'
+      && F({ silent_sec: 10, rows_seen: 5, problem: 'no grid' }, { inSession: false }) === 'degraded');
+    chk('0 rows in the session → degraded; outside → ok',
+      F({ silent_sec: 10, rows_seen: 0, submission_sec: 20, has_submission_clock: true }) === 'degraded'
+      && F({ silent_sec: 10, rows_seen: 0, submission_sec: 20, has_submission_clock: true }, { inSession: false }) === 'ok');
+    chk('checking in but nothing accepted → degraded (the failing-POST case that read ok)',
+      F({ silent_sec: 10, rows_seen: 40, submission_sec: 1200, has_submission_clock: true }) === 'degraded'
+      && F({ silent_sec: 10, rows_seen: 40, submission_sec: null, has_submission_clock: true }) === 'degraded');
+    chk('a pre-040 row (no submission clock) is judged on the check-in only',
+      F({ silent_sec: 10, rows_seen: 40, submission_sec: null, has_submission_clock: false }) === 'ok');
+    await fx.heartbeat('depth', { secondsAgo: 5, rowsSeen: 42, problem: 'panel cannot find the ladder' });
+    const ros2 = await feedHealth.roster({ maxAgeSec: 300, inSession: true });
+    const d2 = ros2.scripts.find((s) => s.script === 'depth');
+    chk('roster: a fresh check-in with a problem is degraded, with the reason', d2.status === 'degraded' && /ladder/.test(d2.reason), d2);
+    chk('inSessionNow: Thu 10:00 Kuwait yes; Fri 10:00 no; Thu 14:00 no',
+      feedHealth.inSessionNow(new Date('2026-09-10T07:00:00Z')) === true
+      && feedHealth.inSessionNow(new Date('2026-09-11T07:00:00Z')) === false
+      && feedHealth.inSessionNow(new Date('2026-09-10T11:00:00Z')) === false);
 
     console.log('\n=== SPR-27 · check() raises a data_alarm for the silent orders feed ===');
     await pool.query("DELETE FROM spread.data_alarm WHERE table_name = 'client_heartbeat'");

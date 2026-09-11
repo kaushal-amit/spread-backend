@@ -68,6 +68,11 @@ function enabled() {
  *  "FUTUREKID resumed 142 · TRADEABLE · target 147 stop 137" */
 function alertText(res) {
   const price = res.resumePriceFils ?? res.resumePrice;
+  // "FTI resumed 149 · NOT COMPUTED — no book captured": the reject names the
+  // missing input, so the phone says which capture failed, not just "no".
+  if (res.notComputed || res.verdict === 'NOT COMPUTED') {
+    return `${res.symbol} resumed ${price ?? '—'} · NOT COMPUTED — ${res.verdictDetail || 'missing input'}`;
+  }
   const parts = [`${res.symbol} resumed ${price}`, res.verdict];
   if (res.tradeable && res.targetFils != null && res.stopFils != null) {
     parts.push(`target ${res.targetFils} stop ${res.stopFils}`);
@@ -188,11 +193,17 @@ async function send(text, { to: toOverride } = {}) {
     sent, failed: results.length - sent, results };
 }
 
-/** Send the alert for a resume payload if it is TRADEABLE. A non-TRADEABLE
- *  resume returns { ok:false, reason:'NOT_TRADEABLE' } WITHOUT sending. */
+/** Send the alert for a resume payload if it is TRADEABLE — or NOT COMPUTED,
+ *  which goes out as a one-line reject naming the missing input (a halt the
+ *  operator does not hear about is the failure the detector exists to stop).
+ *  Every other non-TRADEABLE verdict returns { ok:false, reason:'NOT_TRADEABLE' }
+ *  WITHOUT sending. */
+function shouldDeliver(res) {
+  return !!res && (res.tradeable === true || res.notComputed === true || res.verdict === 'NOT COMPUTED');
+}
 async function sendResume(res) {
-  if (!res || !res.tradeable) return { ok: false, reason: 'NOT_TRADEABLE', sent: 0 };
+  if (!shouldDeliver(res)) return { ok: false, reason: 'NOT_TRADEABLE', sent: 0 };
   return send(alertText(res));
 }
 
-module.exports = { send, sendResume, alertText, enabled, config };
+module.exports = { send, sendResume, shouldDeliver, alertText, enabled, config };

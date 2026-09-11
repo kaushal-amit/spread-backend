@@ -16,10 +16,10 @@ const stops = require('../src/services/stops');
 let p = 0, n = 0;
 const chk = (t, c, x) => { n++; if (c) p++; else console.log('  FAIL', t, x === undefined ? '' : JSON.stringify(x)); };
 
-const DAY = '2003-06-07';                     // an isolated day nothing else touches
+const DAY = '2003-06-08';                     // an isolated SUNDAY nothing else touches (a Saturday is closed by rule)
 const SYM = 'SZTESTCLOSE';
 // A Kuwait wall-clock instant on DAY (UTC+3, no DST).
-const kut = (hh, mm) => new Date(Date.UTC(2003, 5, 7, hh - 3, mm, 0));
+const kut = (hh, mm) => new Date(Date.UTC(2003, 5, 8, hh - 3, mm, 0));
 
 (async () => {
   try {

@@ -45,7 +45,7 @@ async function evaluate(symbol, tradingDay, {
     `SELECT bid::numeric AS bid, bid_qty::bigint AS bid_shares,
             offer::numeric AS offer, offer_qty::bigint AS offer_shares, created_at
        FROM spread.v_quote_screening
-      WHERE upper(symbol) = $1 ORDER BY created_at DESC LIMIT 1;`, [sym]);
+      WHERE symbol = upper($1) ORDER BY created_at DESC LIMIT 1;`, [sym]);
   if (!q) return { symbol: sym, fire: false, reason: 'no quote' };
 
   const bid = Number(q.bid), offer = Number(q.offer);

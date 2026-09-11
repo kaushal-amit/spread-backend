@@ -1,0 +1,14 @@
+# The image must never carry credentials or a checkout's local state.
+# `COPY . .` in the Dockerfile copied .env (the RDS superuser URL and the
+# Anthropic key) into every image built from a working checkout.
+.env
+.env.*
+!.env.example
+node_modules
+.git
+.github
+*.patch
+test
+docs
+kb/skills
+scripts/lint-rules.sh

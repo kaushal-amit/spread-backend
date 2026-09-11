@@ -132,20 +132,33 @@ function feasible(ticks, { gapPct, rangeFils } = {}, targets = null) {
   const minGap = targets?.minGapPctFor2Tick ?? 30;
   const minRange = targets?.minRangeFilsFor3Tick ?? 6;
 
-  if (ticks === 1) return { ok: true, why: null };
+  const known = (v) => v != null && v !== '' && Number.isFinite(Number(v));
+  if (ticks === 1) return { ok: true, why: null, notComputed: false };
   if (ticks === 2) {
+    // No statistic is NOT "present 0% of the session": gap_pct comes only
+    // from symbol_day_stats, and while that bridge was empty every 2-tick
+    // symbol read "present only 0%" as a STRUCTURAL failure — the board said
+    // the stock was unfixable when the number was simply never computed.
+    if (!known(gapPct)) {
+      return { ok: false, notComputed: true,
+        why: '2-fil spread presence not computed — gap_pct has no value for this session (stats:daily has not written it)' };
+    }
     // A gap that is not there most of the session is not a queue-zero entry.
     // One stock had the widest range on the board at 16.6 fils and still
     // failed: its 2-fil spread was present only 22% of the time.
     const ok = Number(gapPct) >= minGap;
-    return { ok, why: ok ? null
-      : `a 2-fil spread is present only ${Math.round(gapPct || 0)}% of the session — below the ` +
+    return { ok, notComputed: false, why: ok ? null
+      : `a 2-fil spread is present only ${Math.round(gapPct)}% of the session — below the ` +
         `${minGap}% needed to enter at queue zero. Joining a 1-fil queue and hoping for a 2-fil ` +
         'move is a directional trade.' };
   }
   if (ticks === 3) {
+    if (!known(rangeFils)) {
+      return { ok: false, notComputed: true,
+        why: 'average trading range not computed — range_trading_fils has no value for this session' };
+    }
     const ok = Number(rangeFils) >= minRange;
-    return { ok, why: ok ? null
+    return { ok, notComputed: false, why: ok ? null
       : `average range ${rangeFils} fils — below the ${minRange} needed for 3 ticks` };
   }
   return { ok: false, why: `${ticks} ticks is beyond the ${MAX_TICKS}-tick cap — that is directional` };
@@ -228,24 +241,34 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
   const gates = [
     pass(1, 'Price band',
       known(priceFils) && priceFils >= cfg.priceFloorFils && priceFils <= ceiling,
-      `${priceFils} fils`,
-      priceFils < cfg.priceFloorFils
-        ? `${priceFils} fils — below 100 the tick is 0.1 fil, so one tick pays about 1.05 KD ` +
-          'against 3.36 in commission. Net is negative at any budget, on any day.'
-        : `${priceFils} fils — above the ${ceiling}-fil ceiling for ${budgetKd} KD`,
+      known(priceFils) ? `${priceFils} fils` : '—',
+      // `null < 100` is true in JavaScript (null coerces to 0), which made a
+      // MISSING price read "null fils — below 100 … negative at any budget"
+      // and STRUCTURAL. A price nobody captured is not computed.
+      !known(priceFils)
+        ? 'price not computed — no close for this session'
+        : priceFils < cfg.priceFloorFils
+          ? `${priceFils} fils — below 100 the tick is 0.1 fil, so one tick pays about 1.05 KD ` +
+            'against 3.36 in commission. Net is negative at any budget, on any day.'
+          : `${priceFils} fils — above the ${ceiling}-fil ceiling for ${budgetKd} KD`,
       { ceiling, floor: cfg.priceFloorFils,
         // Arithmetic, not judgement. There is no market condition under which
         // this trade wins, so an override button here only ever loses money.
-        structural: priceFils < cfg.priceFloorFils }),
+        structural: known(priceFils) && priceFils < cfg.priceFloorFils,
+        notComputedInput: !known(priceFils) }),
 
     pass(2, 'Profit floor',
       known(econ.netKd) && econ.netKd >= cfg.netFloorKd && feas.ok,
       econ.netKd == null ? '—' : `${econ.netKd >= 0 ? '+' : '−'}${Math.abs(econ.netKd).toFixed(2)}`,
-      !feas.ok ? feas.why
-        : `net ${econ.netKd} KD at ${targetTicks} tick${targetTicks === 1 ? '' : 's'} — ` +
-          `below the ${cfg.netFloorKd} floor`,
+      !known(econ.netKd) ? 'net not computed — no price for this session'
+        : !feas.ok ? feas.why
+          : `net ${econ.netKd} KD at ${targetTicks} tick${targetTicks === 1 ? '' : 's'} — ` +
+            `below the ${cfg.netFloorKd} floor`,
       { shares: econ.shares, roundTripKd: econ.roundTripKd, targetTicks,
-        sub: `${targetTicks || '—'} tick target`, structural: !feas.ok }),
+        sub: `${targetTicks || '—'} tick target`,
+        // An infeasible target is structural; an UNCOMPUTED feasibility is not.
+        structural: known(econ.netKd) && !feas.ok && !feas.notComputed,
+        notComputedInput: !known(econ.netKd) || feas.notComputed === true }),
 
     pass(3, 'Trade size',
       known(avgTrade) && avgTrade >= cfg.minAvgTradeShares,
@@ -263,12 +286,15 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
         ? (known(moves2) ? `${moves2} of 2+` : '—')
         : (known(moves) ? String(moves) : '—'),
       targetTicks >= 2
-        ? `${moves2} up-moves of 2+ fils — a 2-tick target needs 2-fil moves, and one stock ` +
-          'had 14 moves a day with a median of ONE'
+        ? (known(moves2)
+          ? `${moves2} up-moves of 2+ fils — a 2-tick target needs 2-fil moves, and one stock ` +
+            'had 14 moves a day with a median of ONE'
+          : 'moves of 2+ fils not computed')
         : known(moves)
           ? `${moves} price moves — a round trip needs price down to your bid AND up to your offer`
           : 'moves not computed',
-      { sub: known(moves2) ? `${moves2} of 2+ fils` : null }),
+      { sub: known(moves2) ? `${moves2} of 2+ fils` : null,
+        notComputedInput: targetTicks >= 2 ? !known(moves2) : !known(moves) }),
 
     pass(5, 'Tape quality',
       known(tinyPct) && tinyPct <= cfg.maxPctMovesSub100,
@@ -370,8 +396,8 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
   const dist8known = known(volRatio) && known(flowRatio ?? blockRatio);
   const CR7 = {
     1:  { cmp: 'within', threshold: `${cfg.priceFloorFils}–${ceiling} fils`, computed: known(priceFils) },
-    2:  { cmp: '≥', threshold: `${cfg.netFloorKd} KD`, computed: known(econ.netKd),
-          override: !feas.ok ? { text: 'no feasible target at this budget — FAIL', verdict: 'FAIL' } : null },
+    2:  { cmp: '≥', threshold: `${cfg.netFloorKd} KD`, computed: known(econ.netKd) && !feas.notComputed,
+          override: !feas.ok && !feas.notComputed ? { text: 'no feasible target at this budget — FAIL', verdict: 'FAIL' } : null },
     3:  { cmp: '≥', threshold: `${cfg.minAvgTradeShares} sh`, computed: known(avgTrade) },
     4:  { cmp: '≥', threshold: targetTicks >= 2 ? `${cfg.minPriceMoves2plus} of 2+/day` : `${cfg.minPriceMoves}/day`,
           computed: targetTicks >= 2 ? known(moves2) : known(moves) },
@@ -416,8 +442,17 @@ function evaluate(row, budgetKd, cfg = GATES, opts = {}) {
    * has to say which. Every one of these read null for weeks and the result
    * was indistinguishable from a quiet market.
    */
+  // Decided from the INPUT (CR7[id].computed, the gate's own notComputedInput
+  // flag), with the reason-text match kept as a backstop. Matching the text
+  // alone let Gate 1 with a null price and Gate 4 with null moves-of-2+ read
+  // as real failures while their CR-7 check said NOT COMPUTED — the bucket
+  // and the chip disagreed on the same stock.
   for (const g of gates) {
-    g.notComputed = !g.ok && /not computed|not available/.test(g.why || '');
+    const m = CR7[g.id];
+    const inputMissing = g.notComputedInput === true || (m && m.computed === false && !m.override);
+    g.notComputed = !g.ok && (inputMissing || /not computed|not available/.test(g.why || ''));
+    if (g.notComputed) g.structural = false;
+    delete g.notComputedInput;
   }
 
   /*

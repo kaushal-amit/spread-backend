@@ -48,8 +48,13 @@ function concurrency(max = 2) {
         detail: `${max} question${max === 1 ? '' : 's'} already in flight` });
     }
     inFlight += 1;
-    res.on('finish', () => { inFlight -= 1; });
-    res.on('close', () => { inFlight = Math.max(0, inFlight - 1); });
+    // ONE decrement per request. Both 'finish' and 'close' fire on a normal
+    // response, so the count went down twice and concurrency(2) let three
+    // through; a flag makes the second event a no-op.
+    let released = false;
+    const release = () => { if (released) return; released = true; inFlight = Math.max(0, inFlight - 1); };
+    res.on('finish', release);
+    res.on('close', release);
     next();
   };
 }

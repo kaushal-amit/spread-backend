@@ -27,6 +27,57 @@ async function run() {
   ck('every check verdict matches the gate ok/warn',
     r.gates.every((g) => g.check.verdict === (g.check.warn ? 'WARN' : g.check.ok ? 'PASS' : g.check.computed ? 'FAIL' : 'NOT_COMPUTED')),
     r.gates.map((g) => [g.id, g.ok, g.check.verdict]));
+  // A missing input is NOT COMPUTED — never structural, never a real FAIL.
+  {
+    const nullGap = funnel.evaluate({ ...base, targetTicks: 2, gap_pct: null }, 800);
+    const g2 = nullGap.gates.find((g) => g.id === 2);
+    ck('null gap_pct → gate 2 NOT COMPUTED, not "present only 0%"', g2.notComputed === true && g2.check.verdict === 'NOT_COMPUTED' && /not computed/.test(g2.why), [g2.why, g2.check.text]);
+    ck('  and NOT structural (the old code called it unfixable)', g2.structural === false && nullGap.structural === false);
+    const nullPrice = funnel.evaluate({ ...base, priceFils: null, close_fils: null, orderPriceFils: null }, 800);
+    const g1 = nullPrice.gates.find((g) => g.id === 1);
+    ck('null price → gate 1 NOT COMPUTED (null < 100 is true in JS — was "null fils — below 100")', g1.notComputed === true && g1.structural === false && !/null fils/.test(g1.why), g1.why);
+    const nullMoves = funnel.evaluate({ ...base, targetTicks: 2, price_moves_2plus: null }, 800);
+    const g4 = nullMoves.gates.find((g) => g.id === 4);
+    ck('null moves-of-2+ on a 2-tick target → gate 4 NOT COMPUTED', g4.notComputed === true && g4.check.verdict === 'NOT_COMPUTED', [g4.why, nullMoves.targetTicks]);
+    ck('the bucket and the chip agree: every NOT_COMPUTED check is a notComputed gate',
+      [nullGap, nullPrice, nullMoves].every((x) => x.gates.every((g) => (g.check.verdict === 'NOT_COMPUTED') === (g.notComputed === true))));
+    const lowGap = funnel.evaluate({ ...base, targetTicks: 2, gap_pct: 10 }, 800);
+    ck('a MEASURED low gap is still a structural FAIL', lowGap.gates.find((g) => g.id === 2).structural === true && lowGap.structural === true);
+  }
+
+  // ── the board's fee math is DATED and MARKET-AWARE ─────────────────────────
+  {
+    const g2 = (o) => funnel.evaluate({ ...base, priceFils: 200, close_fils: 200, orderPriceFils: 200 }, 700, undefined, o).gates.find((g) => g.id === 2);
+    const sep = g2({ day: '2026-09-10' }), oct = g2({ day: '2026-10-01' }), prem = g2({ day: '2026-10-01', premier: true });
+    ck('from 1 Oct 2026 the round trip is 1.000 KD cheaper (two settlements gone)', Number((sep.roundTripKd - oct.roundTripKd).toFixed(3)) === 1.0, [sep.roundTripKd, oct.roundTripKd]);
+    ck('a Premier symbol is costed at 0.10%, not Main\'s 0.15%', prem.roundTripKd < oct.roundTripKd, [prem.roundTripKd, oct.roundTripKd]);
+    ck('no day → the pre-October figure (unchanged default)', g2({}).roundTripKd === sep.roundTripKd);
+  }
+
+  // ── the day rolls: sockets that follow "today" move rooms ─────────────────
+  {
+    const mk = (day, follows) => { const joined = [], left = [], sent = []; return { data: { day, followsToday: follows }, join: (r) => joined.push(r), leave: (r) => left.push(r), emit: (ev, a) => sent.push([ev, a]), joined, left, sent }; };
+    const a = mk('2026-09-09', true), b = mk('2026-09-09', false), c = mk('2026-09-10', true);
+    const io = { sockets: { sockets: new Map([['a', a], ['b', b], ['c', c]]) } };
+    const moved = require('../src/socket').followDay(io, '2026-09-10');
+    ck('a follower of today is moved from yesterday\'s room to today\'s', moved === 1 && a.left[0] === 'day:2026-09-09' && a.joined[0] === 'day:2026-09-10' && a.data.day === '2026-09-10', [a.left, a.joined]);
+    ck('  and told (spread:day)', a.sent[0] && a.sent[0][0] === 'spread:day' && a.sent[0][1].day === '2026-09-10', a.sent);
+    ck('a socket that chose a date stays; one already on today is untouched', b.joined.length === 0 && c.joined.length === 0);
+  }
+
+  // ── §0 · the socket board carries an error flag when it could not compute ──
+  {
+    const socket = require('../src/socket');
+    const routes = require('../src/api/routes');
+    const realBoard = routes.board;
+    routes.board = async () => { throw Object.assign(new Error('db down'), { code: 'DB_DOWN' }); };
+    const broken = await socket.view('2026-09-10', 800).catch((e) => ({ threw: e.message }));
+    routes.board = realBoard;
+    ck('a failing board emits error {code}, not a clean empty board', broken.error && broken.error.code === 'DB_DOWN' && broken.recommended.length === 0, broken.error);
+    const noBudget = await socket.view('2026-09-10', null).catch((e) => ({ threw: e.message }));
+    ck('a null budget emits NOT_READY (REST answers 503 for the same case)', noBudget.error && noBudget.error.code === 'NOT_READY', noBudget.error);
+  }
+
   const g5 = r.gates.find((g) => g.id === 5).check;
   ck('a check reads "<value> <cmp> <threshold> — VERDICT"', /^10% ≤ 20% — PASS$/.test(g5.text), g5.text);
   ck('the threshold carries its unit', /%$/.test(g5.threshold), g5.threshold);
@@ -66,6 +117,22 @@ async function run() {
   // once the run finished, the next call runs (not skipped forever)
   await slow();
   ck('a later call runs once the loop is free again', socket.scannerHealth()['unit-guard'].runs === 2, socket.scannerHealth()['unit-guard']);
+
+  // ── the health is TRUTHFUL: a failing scan is recorded, an idle one is not "work" ──
+  {
+    let n = 0;
+    const flaky = socket.scanner('unit-flaky', async () => { n += 1; if (n <= 2) throw new Error('db down'); return 'idle'; });
+    await flaky(); await flaky();
+    let f = socket.scannerHealth()['unit-flaky'];
+    ck('a scan that throws does NOT advance lastSuccessAt', f.lastSuccessAt === null && f.errors === 2 && f.lastError === 'db down' && !!f.lastErrorAt, f);
+    await flaky();
+    f = socket.scannerHealth()['unit-flaky'];
+    ck('a clean run advances lastSuccessAt and clears lastError', !!f.lastSuccessAt && f.lastError === null, f);
+    ck('an early return (idle) is a success but not WORK: lastWorkAt stays null, idle counts', f.lastWorkAt === null && f.idle === 1, f);
+    const worker = socket.scanner('unit-worker', async () => 'did something');
+    await worker();
+    ck('a run that did work stamps lastWorkAt', !!socket.scannerHealth()['unit-worker'].lastWorkAt);
+  }
 
   // ── SPR-28 · the 13:45 scheduler firing logic (stubbed DB + stats) ────────
   const stats = require('../src/jobs/stats');
@@ -114,6 +181,52 @@ async function run() {
     startAt('2026-09-02T11:30:00Z', { runBackfill: false });          // Kuwait Wed 14:30
     await sleep(40);
     ck('boot catch-up runs today once when the slot was missed', dailyCalls.length === 1, dailyCalls);
+
+    // Scenario D · a skipped minute does not lose the day (due from 13:45 ONWARD).
+    dailyCalls = [];
+    const D = startAt('2026-09-02T10:44:00Z', { runBackfill: false });  // Kuwait 13:44
+    await sleep(30);
+    D.setClock('2026-09-02T10:47:00Z');                               // the 13:45 and 13:46 ticks never happened
+    await sleep(40);
+    ck('due from 13:45 onward: a missed minute still fires', dailyCalls.length === 1, dailyCalls);
+
+    // Scenario E · a FAILED run is not marked done — it is retried with backoff.
+    dailyCalls = [];
+    let fails = 2;
+    stats.runDaily = async (day) => { dailyCalls.push(day); if (fails-- > 0) throw new Error('db hiccup'); return { rows: 1, minMinutes: 1, maxMinutes: 1, reconcileFees: { broker: 'x', adjusted: 0 } }; };
+    const E = startAt('2026-09-02T10:45:00Z', { runBackfill: false });
+    await sleep(40);
+    ck('the first attempt failed', dailyCalls.length === 1);
+    E.setClock('2026-09-02T10:45:30Z'); await sleep(30);
+    ck('no retry inside the 1-minute backoff', dailyCalls.length === 1, dailyCalls);
+    E.setClock('2026-09-02T10:46:30Z'); await sleep(30);
+    ck('retried after 1 minute (failed again)', dailyCalls.length === 2, dailyCalls);
+    E.setClock('2026-09-02T10:47:30Z'); await sleep(30);
+    ck('backoff doubled: no retry after 1 more minute', dailyCalls.length === 2, dailyCalls);
+    E.setClock('2026-09-02T10:49:00Z'); await sleep(30);
+    ck('retried after 2 minutes and succeeded', dailyCalls.length === 3, dailyCalls);
+    E.setClock('2026-09-02T11:30:00Z'); await sleep(30);
+    ck('once done, no further runs that day', dailyCalls.length === 3, dailyCalls);
+
+    // Scenario F · done is the TABLE: a row already present → nothing runs.
+    dailyCalls = [];
+    const withRow = { query: async (sql) => (/FROM spread\.symbol_day_stats WHERE trading_day/.test(sql) ? { rows: [{ '?column?': 1 }] } : { rows: [] }) };
+    handles.push(schedule.startDailyStatsScheduler({ db: withRow, everyMs: 10, time: '13:45', now: () => Date.parse('2026-09-02T11:30:00Z'), guard: null, runBackfill: false }));
+    await sleep(40);
+    ck('a day whose bridge row exists is not re-run', dailyCalls.length === 0, dailyCalls);
+
+    // Scenario G · the 09:45 job is scheduled the same way.
+    const m45 = require('../src/jobs/m45');
+    const realM45 = m45.computeM45; const m45Calls = [];
+    m45.computeM45 = async (day) => { m45Calls.push(day); return { computed: 3, skipped: 0, thin: 0 }; };
+    let clockG = Date.parse('2026-09-02T06:40:00Z');                 // Kuwait 09:40
+    handles.push(schedule.startM45Scheduler({ db: stubDb, everyMs: 10, now: () => clockG, guard: null }));
+    await sleep(30);
+    ck('m45: not due before 09:46', m45Calls.length === 0, m45Calls);
+    clockG = Date.parse('2026-09-02T06:50:00Z');                      // Kuwait 09:50
+    await sleep(40);
+    ck('m45: runs once after the window closes', m45Calls.length === 1 && m45Calls[0] === '2026-09-02', m45Calls);
+    m45.computeM45 = realM45;
   } finally {
     for (const x of handles) clearInterval(x);
     stats.runDaily = realRunDaily; stats.computeDay = realComputeDay;

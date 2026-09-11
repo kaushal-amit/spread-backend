@@ -47,7 +47,14 @@ module.exports = {
       // The app logs structured JSON to stdout already; let pm2 timestamp the
       // capture so `pm2 logs` lines are ordered even across a restart.
       time: true,
+      // PRODUCTION BY DEFAULT. `pm2 start ecosystem.config.js` is the deploy
+      // command; with development as the default the one interlock that
+      // refuses to boot on an empty token or CORS '*' was downgraded to a
+      // warning on the live server. Use `--env development` locally.
       env: {
+        NODE_ENV: 'production',
+      },
+      env_development: {
         NODE_ENV: 'development',
       },
       env_production: {

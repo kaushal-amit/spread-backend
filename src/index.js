@@ -21,7 +21,7 @@ const { toResponse } = require('./api/errors');
 
 const { registerHandlers, startTicker, startWakeupScanner, startAlertScanner,
   startRowPoller, startHaltScanner, startFeedHealthScanner, scanner } = require('./socket');
-const { startDailyStatsScheduler } = require('./jobs/schedule');
+const { startDailyStatsScheduler, startM45Scheduler } = require('./jobs/schedule');
 
 const PORT = Number(process.env.PORT || 4000);
 const app = express();
@@ -232,6 +232,7 @@ const timers = []; // interval handles, cleared on shutdown
     // runDaily cannot overlap and /health sees its lastSuccessAt). Boot catch-up
     // for today and the historical backfill run in the background inside start().
     timers.push(startDailyStatsScheduler({ guard: scanner }));
+    timers.push(startM45Scheduler({ guard: scanner }));
   } catch (e) {
     log.error('[boot] failed:', e.message);
     process.exit(1);

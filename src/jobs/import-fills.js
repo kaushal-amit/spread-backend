@@ -87,7 +87,7 @@ const isSynthetic = (id) => /^(syn:|SYN-)/i.test(String(id || ''));
 /** The fill's natural key, WITHOUT order_time or id — same fill, same key. */
 const natKey = (r) => [r.symbol, r.side, Number(r.price), Number(r.shares), toDay(r.trading_date)].join('|');
 
-function plan(rows, { seqStart = {}, known = new Set() } = {}) {
+function plan(rows, { seqStart = {}, known = new Set(), openStart = [] } = {}) {
   // 1 · dedupe
   //
   // The natural keys a REAL broker order fills. A synthetic reconstruction of
@@ -95,14 +95,45 @@ function plan(rows, { seqStart = {}, known = new Set() } = {}) {
   // twice — and because client rows carry no order_time, this cannot lean on
   // a timestamp.
   const realNat = new Set();
-  for (const r of rows) if (!isSynthetic(r.order_id)) realNat.add(natKey(r));
+  const realByNat = new Map(); // natKey -> the real rows that fill it
+  for (const r of rows) {
+    if (isSynthetic(r.order_id)) continue;
+    realNat.add(natKey(r));
+    const k = natKey(r);
+    if (!realByNat.has(k)) realByNat.set(k, []);
+    realByNat.get(k).push(r);
+  }
 
   const seen = new Map();
   const dropped = [];
+  const feeCarried = [];
   for (const r of rows) {
     // A synthetic row whose fill a REAL order already covers is a duplicate,
     // whatever its id or (missing) time.
-    if (isSynthetic(r.order_id) && realNat.has(natKey(r))) { dropped.push(r.order_id); continue; }
+    if (isSynthetic(r.order_id) && realNat.has(natKey(r))) {
+      // THE FEE TRAVELS WITH THE FILL, NOT WITH THE ID. On 8 MRC legs the
+      // synthetic twin carried the broker's net_value/order_value and the
+      // real-id row carried none; dropping the twin dropped the broker fee,
+      // the leg fell back to the COMPUTED rate (2.171 → 1.560 on a 3,500 @
+      // 202 buy) and the ledger came out 0.611 KD per leg too kind — the
+      // −94.127 vs −94.738 gap. reconcile-fees cannot repair it afterwards:
+      // the surviving row has no broker figure to reconcile against. So a
+      // real row without a usable broker fee takes the twin's figures before
+      // the twin goes. Same price × shares → the same fee, so every real row
+      // on this key that lacks one gets it.
+      const fee = brokerFee(r);
+      if (fee != null) {
+        for (const real of realByNat.get(natKey(r))) {
+          if (brokerFee(real) != null) continue;
+          real.net_value = r.net_value;
+          real.order_value = r.order_value;
+          real.fee_carried_from = r.order_id;
+          feeCarried.push({ to: real.order_id, from: r.order_id, feeKd: fee });
+        }
+      }
+      dropped.push(r.order_id);
+      continue;
+    }
     // Distinct REAL ids are distinct trades and never merge (MUBARRAD's two
     // round trips at one price). Timed rows still de-dupe an exact twin by
     // (symbol,side,price,shares,day,time); synthetics-only collapse on the
@@ -131,6 +162,17 @@ function plan(rows, { seqStart = {}, known = new Set() } = {}) {
   const seq = { ...seqStart };
   const open = new Map();          // symbol -> [{seq, remaining, day}]
   const legs = [], orphans = [], skipped = [];
+  // THE QUEUE STARTS FROM WHAT THE LEDGER ALREADY HOLDS. On a second
+  // (incremental) run every already-imported buy is skipped below — before
+  // it could enter this queue — so a sell that arrived later found "no open
+  // contract in this symbol", was booked as an orphan, and the position
+  // stayed open for ever (and, through the one-position rule, blocked every
+  // new one). run() passes positions.openBuys(); each open contract is
+  // seeded with its remaining shares, oldest first.
+  for (const o of openStart) {
+    if (!open.has(o.symbol)) open.set(o.symbol, []);
+    open.get(o.symbol).push({ seq: Number(o.seq), remaining: Number(o.remaining), day: toDay(o.day), carried: true });
+  }
 
   for (const r of fills) {
     if (known.has(r.order_id)) { skipped.push(r.order_id); continue; }
@@ -151,7 +193,7 @@ function plan(rows, { seqStart = {}, known = new Set() } = {}) {
       open.get(r.symbol).push({ seq: s, remaining: shares, day });
       legs.push({ order_id: r.order_id, symbol: r.symbol, side: 'BUY', day, seq: s, price: Number(r.price),
         shares, filled: shares, fee, feeSource, executions: execs, netValue: r.net_value,
-        premier, computedFee: computed.kd });
+        premier, computedFee: computed.kd, at: r.order_time || null });
       continue;
     }
 
@@ -166,7 +208,8 @@ function plan(rows, { seqStart = {}, known = new Set() } = {}) {
         shares: take, filled: take,
         fee: Number((fee * part).toFixed(3)), feeSource, executions: execs, netValue: r.net_value,
         premier, computedFee: Number((computed.kd * part).toFixed(3)),
-        split: take !== shares ? { of: shares } : null });
+        split: take !== shares ? { of: shares } : null, at: r.order_time || null,
+        closesCarried: c.carried === true });
       c.remaining -= take; left -= take;
       if (c.remaining === 0) q.shift();
     }
@@ -175,9 +218,9 @@ function plan(rows, { seqStart = {}, known = new Set() } = {}) {
   }
 
   const stillOpen = [];
-  for (const [symbol, q] of open) for (const c of q) stillOpen.push({ symbol, seq: c.seq, remaining: c.remaining, since: c.day });
+  for (const [symbol, q] of open) for (const c of q) stillOpen.push({ symbol, seq: c.seq, remaining: c.remaining, since: c.day, carried: c.carried === true });
 
-  return { legs, orphans, dropped, skipped, stillOpen };
+  return { legs, orphans, dropped, skipped, stillOpen, feeCarried };
 }
 
 /** Write the plan. ONE transaction. */
@@ -191,14 +234,24 @@ async function apply(p, db = pool) {
            (trading_day, symbol, contract_seq, side, status, price_fils, shares, filled_shares,
             commission_kd, executions, posted_at, resolved_at, broker_order_id, broker_net_value_kd,
             fee_source, fee_delta_kd, exit_venue, note)
-         VALUES ($1,$2,$3,$4,'FILLED',$5,$6,$7,$8,$9,$1::date + time '09:00',$1::date + time '09:00',
+         VALUES ($1,$2,$3,$4,'FILLED',$5,$6,$7,$8,$9,
+                 COALESCE($16::timestamptz, ($1::date::text || 'T09:00:00+03:00')::timestamptz),
+                 COALESCE($16::timestamptz, ($1::date::text || 'T09:00:00+03:00')::timestamptz),
                  $10,$11,$12,$13,$14,$15)
          RETURNING *;`,
         [l.day, l.symbol, l.seq, l.side, l.price, l.shares, l.filled, l.fee, l.executions,
          l.order_id, l.netValue, l.feeSource === 'BROKER' ? 'BROKER' : 'IMPORTED',
          l.feeSource === 'BROKER' ? Number((l.fee - l.computedFee).toFixed(3)) : null,
          l.side === 'SELL' ? 'MARKET' : null,
-         `imported from awsat_order_list ${l.order_id}` + (l.split ? ` (${l.shares} of ${l.split.of})` : '')]);
+         `imported from awsat_order_list ${l.order_id}` + (l.split ? ` (${l.shares} of ${l.split.of})` : '')
+           + (l.at ? '' : ' (no order_time — stamped 09:00 Kuwait)'),
+         // The broker's own time when the row has one. The old literal
+         // `$1::date + time '09:00'` was a timestamp WITHOUT time zone, cast in
+         // the server's zone — 09:00 UTC is noon in Kuwait — and every imported
+         // leg carried it, so the 30-minute cool-off and the 20-minute time
+         // stop ran on an invented clock. Without a time, 09:00 KUWAIT,
+         // explicitly, and the note says so.
+         l.at ? new Date(l.at).toISOString() : null]);
       await bookFill(client, { day: l.day, leg, side: l.side, shares: l.filled,
         priceFils: l.price, feeKd: l.fee, symbol: l.symbol });
     }
@@ -217,8 +270,10 @@ async function run({ apply: doApply = false, db = pool } = {}) {
     'SELECT broker_order_id FROM spread.order_leg WHERE broker_order_id IS NOT NULL;');
   const seqStart = Object.fromEntries(seqs.map((s) => [s.symbol, Number(s.seq)]));
   const known = new Set(knownRows.map((k) => k.broker_order_id));
+  const openStart = (await require('../api/positions').openBuys(db))
+    .map((o) => ({ symbol: o.symbol, seq: o.contract_seq, remaining: o.remaining_shares, day: o.trading_day }));
 
-  const p = plan(rows, { seqStart, known });
+  const p = plan(rows, { seqStart, known, openStart });
   if (doApply && p.legs.length) await apply(p, db);
   return { ...p, brokerRows: rows.length, applied: doApply };
 }

@@ -57,7 +57,8 @@ const CACHE_MS = 5000;
 // each missed it and ran the funnel six times over identical data. Now a run in
 // progress for a key is shared, so the funnel runs once per (day, budget,
 // version), whether the six arrive together or one after another.
-const boardCache = new Map();     // key -> { at, value }
+const boardCache = new Map();     // key -> { at, value }  (insertion-ordered: oldest first)
+const BOARD_CACHE_MAX = 8;        // today + a few what-ifs/review days; never a leak
 const boardInflight = new Map();  // key -> Promise<value>
 let boardRuns = 0;                // the funnel-run counter the concurrency test asserts on
 const log = require('../lib/log');
@@ -109,6 +110,13 @@ async function board(day, budgetKd) {
     log.info(`[board] asked ${day} → screened ${screenDay} · ${value?.counts?.all ?? 0} symbols `
       + `(${value?.counts?.recommended ?? 0} rec / ${value?.counts?.nearMiss ?? 0} near / ${value?.counts?.rejected ?? 0} rej)`);
     boardCache.set(key, { at: Date.now(), value });
+    // The cache never evicted: one entry per (day, budget, gate version) —
+    // every ?budgetKd= what-if, every review date — each a full board (~0.5 MB),
+    // held until restart and growing toward pm2's 512 MB limit, whose restart
+    // wipes the in-memory session state mid-day. Sweep what is past CACHE_MS
+    // and cap the rest; a miss costs one funnel run, a leak costs the session.
+    for (const [k, v] of boardCache) if (Date.now() - v.at > CACHE_MS) boardCache.delete(k);
+    while (boardCache.size > BOARD_CACHE_MAX) boardCache.delete(boardCache.keys().next().value);
     return value;
   })();
   boardInflight.set(key, promise);

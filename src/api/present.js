@@ -16,8 +16,17 @@
 
 const { GATES, DIRECTION, EVIDENCE, EXIT, BUDGET, QUALITY } = require('../config/spread.config');
 
+/*
+ * A NUMBER THAT IS NOT KNOWN TRAVELS AS NULL, NEVER AS 0.
+ *
+ * n2() turned null into 0 for price, bid, offer, spread, net and every metric.
+ * With the stats bridge empty the board printed "tiny 0% · mv 0 · vol 0×" for
+ * 140 NOT COMPUTED symbols, and "0" is a measurement — a stock with 0 moves is
+ * dead, a stock with an unknown count is uncounted. n2 is kept for the few
+ * fields that are genuinely zero when absent (a count of flags, a shares
+ * figure derived from a known price); everything measured uses n2n.
+ */
 const n2 = (v) => (v == null || Number.isNaN(Number(v)) ? 0 : Number(Number(v).toFixed(2)));
-// 3.8 · nullable: a number that is not known travels as null, never as 0.
 const n2n = (v) => (v == null || Number.isNaN(Number(v)) ? null : Number(Number(v).toFixed(2)));
 const n3 = (v) => (v == null || Number.isNaN(Number(v)) ? 0 : Number(Number(v).toFixed(3)));
 
@@ -139,24 +148,24 @@ function stockCandidate(r, budgetKd) {
     : r.failed.length === 1 ? 'NEAR_MISS'
     : 'NOT_RECOMMENDED';
 
-  const shares = r.entry?.shares ?? r.netAtTarget?.shares ?? 0;
-  const netKd = n2(r.netAtTarget?.netKd);
+  const shares = r.entry?.shares ?? r.netAtTarget?.shares ?? null;
+  const netKd = n2n(r.netAtTarget?.netKd);
 
   return {
     symbol: r.symbol,
     nameAr: r.nameAr || undefined,
-    price: n2(r.priceFils),
-    bid: n2(r.bidFils),
-    offer: n2(r.offerFils),
-    spread: n2(r.spreadFils),
+    price: n2n(r.priceFils),
+    bid: n2n(r.bidFils),
+    offer: n2n(r.offerFils),
+    spread: n2n(r.spreadFils),
     entryPlacement: r.entryPlacement === 'INSIDE_GAP' ? 'INSIDE' : 'AT_BID',
     shares,
-    notionalKd: n2(r.entry?.notionalKd ?? r.netAtTarget?.notionalKd),
-    roundTripKd: n2(r.netAtTarget?.roundTripKd),
+    notionalKd: n2n(r.entry?.notionalKd ?? r.netAtTarget?.notionalKd),
+    roundTripKd: n2n(r.netAtTarget?.roundTripKd),
     netKd,
     // Net per FIL, not per trade. At 119 fils a fil pays +3.57; at 235 it pays
     // +0.04, and that ratio is the whole price-band argument.
-    netPerFilKd: shares ? n3(shares / 1000) : 0,
+    netPerFilKd: shares ? n3(shares / 1000) : null,
     trendWarn: !!r.directionWarn,
     /*
      * The day's change, in fils, against the previous SESSION close.
@@ -168,9 +177,9 @@ function stockCandidate(r, budgetKd) {
      * Direction ORDERS the list and FLAGS. It never filters: a stock that fell
      * yesterday is 44% to rise today, which is a coin flip.
      */
-    changeFils: r.changeFils ?? 0,
-    changePct: r.priceFils && r.changeFils
-      ? n2((100 * r.changeFils) / (r.priceFils - r.changeFils)) : 0,
+    changeFils: r.changeFils == null ? null : n2n(r.changeFils),
+    changePct: r.priceFils != null && r.changeFils != null && Number(r.priceFils) !== Number(r.changeFils)
+      ? n2((100 * r.changeFils) / (r.priceFils - r.changeFils)) : null,
     rising: r.rising ?? null,
     status,
     verdict,
@@ -181,11 +190,11 @@ function stockCandidate(r, budgetKd) {
     takeItBecause: takeItBecause(r),
     careful: careful(r),
     headroom: {
-      minKd: n2(r.minBudgetKd),
-      maxKd: n2(r.maxBudgetKd),
-      profitPerFil: shares ? n3(shares / 1000) : 0,
-      currentKd: n2(budgetKd),
-      headroomX: r.maxBudgetKd ? n2(r.maxBudgetKd / budgetKd) : 0,
+      minKd: n2n(r.minBudgetKd),
+      maxKd: n2n(r.maxBudgetKd),
+      profitPerFil: shares ? n3(shares / 1000) : null,
+      currentKd: n2n(budgetKd),
+      headroomX: r.maxBudgetKd && budgetKd ? n2(r.maxBudgetKd / budgetKd) : null,
     },
     // Premier pays 0.10% against Main's 0.15%. `marketVerified` is false when
     // the market is an assumption rather than listing data.
@@ -209,18 +218,18 @@ function stockCandidate(r, budgetKd) {
      * comparison ran against `undefined` and the panel reported zero.
      */
     metrics: {
-      priceFils: n2(r.priceFils),
+      priceFils: n2n(r.priceFils),
       netKd,
       // A5 · the 09:00–09:45 range-over-cost. A ranking column, NOT a gate: null
       // before the 09:45 job has run (the board shows "—"); a THIN/absent window
       // carries the reason for the tooltip. Sourced from spread.m45 by day.
       m45: r.m45 == null ? null : n3(r.m45),
       m45Reason: r.m45Reason ?? null,
-      netPerFilKd: shares ? n3(shares / 1000) : 0,
-      tradeSizeShares: n2(r.avg_trade_shares),
-      movesPerDay: n2(r.price_moves),
-      moves2PlusPerDay: n2(r.price_moves_2plus),
-      tapeQualityPct: n2(r.pct_moves_sub100),
+      netPerFilKd: shares ? n3(shares / 1000) : null,
+      tradeSizeShares: n2n(r.avg_trade_shares),
+      movesPerDay: n2n(r.price_moves),
+      moves2PlusPerDay: n2n(r.price_moves_2plus),
+      tapeQualityPct: n2n(r.pct_moves_sub100),
       // The up-only figure beside the blended one. Divergence is information:
       // up-only at twice blended means the up-moves are the small prints.
       tapeQualityUpPct: r.pct_moves_sub100_up == null ? null : n2(r.pct_moves_sub100_up),
@@ -230,15 +239,15 @@ function stockCandidate(r, budgetKd) {
         const b = r.pct_moves_sub100, u = r.pct_moves_sub100_up;
         return b != null && u != null && Number(b) > 0 && Number(u) >= 2 * Number(b) && Number(u) >= 30;
       })(),
-      postablePct: n2(r.pct_session_postable_800),
-      exitDepthPct: n2(r.pct_session_exitable_ratio),
-      volSpikeRatio: n2(r.volume_ratio_5d),
+      postablePct: n2n(r.pct_session_postable_800),
+      exitDepthPct: n2n(r.pct_session_exitable_ratio),
+      volSpikeRatio: n2n(r.volume_ratio_5d),
       // OUTWARD flow. High means the big trades are on the way down — size
       // leaving while the price rises, which is what makes a spike dangerous.
-      outwardBlockFlowRatio: n2(r.flow_ratio ?? r.block_ratio),
-      consistencyDays: n2(r.days_active_5d),
-      gapPresentPct: n2(r.gap_pct),
-      dailyRangeFils: n2(r.range_trading_fils),
+      outwardBlockFlowRatio: n2n(r.flow_ratio ?? r.block_ratio),
+      consistencyDays: n2n(r.days_active_5d),
+      gapPresentPct: n2n(r.gap_pct),
+      dailyRangeFils: n2n(r.range_trading_fils),
       targetTicks: r.targetTicks ?? 1,
     },
     dataQuality: r.dataQuality || 'OK',

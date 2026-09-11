@@ -176,10 +176,25 @@ async function marketPhase(day, now, db = pool) {
   return r ? (r.session ?? null) : null; // NULL = no recent reading / capture defect → evaluate
 }
 
-/** Is the trading day over, per the exchange phase and the 13:30 hard rule? */
-function isClosed(phase, nowMins) {
+/** Kuwait day-of-week of a trading day (0 = Sunday … 6 = Saturday). */
+const kuwaitDow = (day) => new Date(`${toDay(day)}T00:00:00Z`).getUTCDay();
+/** Boursa Kuwait trades Sunday–Thursday. */
+const isWeekend = (day) => { const d = kuwaitDow(day); return d === 5 || d === 6; };
+
+/**
+ * Is the trading day over? By the exchange phase, by the 13:30 hard rule, or
+ * because it is not a session day at all.
+ *
+ * The clock rule no longer needs a phase reading: with no quote in the last
+ * 15 minutes (the normal state all evening) `phase` is null, and null used to
+ * mean "evaluate" — so at 16:53 canOpen read true and a POSTED BUY was
+ * accepted. Outside the session there are no exceptions: past 13:30, and on
+ * Friday and Saturday, the day is closed whatever the captures say.
+ */
+function isClosed(phase, nowMins, day = null) {
+  if (day != null && isWeekend(day)) return true;
   if (phase != null && phase !== 'Trading') return true;          // Close Auction / Trading at Last / Close-Of-Day
-  if (phase === 'Trading' && nowMins >= TRADING_DAY_END_MINS) return true; // a capture left running past the close
+  if (nowMins >= TRADING_DAY_END_MINS) return true;               // past the close, whatever the phase reads
   return false;
 }
 
@@ -192,10 +207,12 @@ async function evaluate(day, { db = pool, now = testNow() } = {}) {
   // recomputation, so the feed and the banner stop churning STOP lines.
   const phase = await marketPhase(day, now, db);
   const nowMinsEarly = kuwaitMins(now);
-  if (isClosed(phase, nowMinsEarly)) {
-    const reason = phase && phase !== 'Trading'
-      ? `the market is closed (${phase}) — the trading day is over`
-      : 'past 13:30 — the trading day is over';
+  if (isClosed(phase, nowMinsEarly, day)) {
+    const reason = isWeekend(day)
+      ? `${kuwaitDow(day) === 5 ? 'Friday' : 'Saturday'} — no session on Boursa Kuwait`
+      : phase && phase !== 'Trading'
+        ? `the market is closed (${phase}) — the trading day is over`
+        : 'past 13:30 — the trading day is over';
     return {
       day: toDay(day), now: new Date(now).toISOString(), clock: minsToClock(nowMinsEarly),
       market: { verdict: 'closed', reason, breadthPct: null, at: null, dropPts: null, hourAgo: null,
@@ -241,7 +258,9 @@ async function evaluate(day, { db = pool, now = testNow() } = {}) {
   const holdToFlatList = await holdToFlat(day, { db, now, t, timeStops: timeStopsList });
   const nowMins = kuwaitMins(now);
   const flatBy = hhmmToMins(t.flat_by_hhmm);
-  const pastFlatBy = nowMins >= flatBy && nowMins < 16 * 60; // after the flat time, until the evening
+  // After the flat time the answer is flat — no evening exception: the old
+  // `&& nowMins < 16:00` bound re-opened the day at 16:00.
+  const pastFlatBy = nowMins >= flatBy;
   const sessionStarted = nowMins >= 9 * 60 + 5;
 
   const reasons = [];   // BLOCKING — canOpen is false while any of these hold
@@ -351,16 +370,16 @@ async function timeStops(day, { db = pool, now = testNow(), t } = {}) {
     const { rows: [pk] } = await db.query(
       `SELECT max(GREATEST(COALESCE(bid::numeric, 0), COALESCE(last_price::numeric, 0))) AS peak
          FROM public.awsat_market_quotes
-        WHERE upper(symbol) = upper($1) AND created_at >= $2 AND created_at <= $3;`, [r.symbol, r.filled_at, now]);
+        WHERE symbol = upper($1) AND created_at >= $2 AND created_at <= $3;`, [r.symbol, r.filled_at, now]);
     const peak = pk && pk.peak != null ? Number(pk.peak) : null;
     if (peak != null && peak > Number(r.entry)) continue;
     const { rows: [q] } = await db.query(
       `SELECT bid::numeric AS bid FROM public.awsat_market_quotes
-        WHERE upper(symbol) = upper($1) AND created_at <= $2 ORDER BY created_at DESC LIMIT 1;`, [r.symbol, now]);
+        WHERE symbol = upper($1) AND created_at <= $2 ORDER BY created_at DESC LIMIT 1;`, [r.symbol, now]);
     out.push({ symbol: r.symbol, seq: Number(r.seq), minutesHeld, entry: Number(r.entry),
       bid: q && q.bid != null ? Number(q.bid) : null });
   }
   return out;
 }
 
-module.exports = { marketGate, sessionStops, evaluate, timeStops, holdToFlat, thresholds, KEYS, kuwaitMins, minsToClock, marketPhase, isClosed, TRADING_DAY_END_MINS };
+module.exports = { marketGate, sessionStops, evaluate, timeStops, holdToFlat, thresholds, KEYS, kuwaitMins, minsToClock, marketPhase, isClosed, isWeekend, TRADING_DAY_END_MINS };

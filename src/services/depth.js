@@ -211,7 +211,7 @@ async function lastMove(symbol, tradingDay, { db = pool, now = null } = {}) {
        SELECT created_at, last_price::numeric AS px, last_qty::bigint AS qty,
               lag(last_price::numeric) OVER (ORDER BY created_at) AS prev
          FROM public.awsat_market_quotes
-        WHERE upper(symbol) = $1 AND trading_date = $2::date AND last_price IS NOT NULL
+        WHERE symbol = upper($1) AND trading_date = $2::date AND last_price IS NOT NULL
           AND ($3::timestamptz IS NULL OR created_at <= $3)
      )
      SELECT px, qty, created_at FROM q
@@ -247,7 +247,7 @@ async function bookAges(symbol, tradingDay, { db = pool, now = null } = {}) {
   const { rows } = await db.query(
     `SELECT captured_at, level, bid::numeric AS bid, bid_qty::bigint AS bid_qty
        FROM spread.v_depth
-      WHERE upper(symbol) = $1 AND spread.kuwait_day(captured_at) = $2::date AND bid IS NOT NULL
+      WHERE symbol = upper($1) AND trading_date = $2::date AND bid IS NOT NULL
       ORDER BY captured_at, level;`, [sym, tradingDay]);
   if (!rows.length) return { symbol: sym, capturedAt: null, bids: [], gaps: [], touch: null, captures: 0 };
 
@@ -359,7 +359,7 @@ async function ladder(symbol, tradingDay, { db = pool, now = null } = {}) {
     `SELECT captured_at, level, bid::numeric AS bid, bid_qty::bigint AS bid_qty,
             offer::numeric AS offer, offer_qty::bigint AS offer_qty
        FROM spread.v_depth
-      WHERE upper(symbol) = $1 AND spread.kuwait_day(captured_at) = $2::date
+      WHERE symbol = upper($1) AND trading_date = $2::date
       ORDER BY captured_at, level;`, [sym, tradingDay]);
   if (!rows.length) return { symbol: sym, capturedAt: null, captures: 0, bids: [], offers: [] };
 

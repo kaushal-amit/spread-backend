@@ -31,6 +31,26 @@ const { unauthorised } = require('./errors');
 
 const TOKEN = process.env.SPREAD_API_TOKEN || null;
 
+/**
+ * The floor for SPREAD_API_TOKEN. The deployed value was 8 characters, shared
+ * with the scraper's ingest token and compiled into the public terminal
+ * bundle. In production a token under this length refuses to boot
+ * (assertProductionConfig); elsewhere it warns.
+ */
+const MIN_TOKEN_LENGTH = 24;
+
+/**
+ * Behind a reverse proxy (TRUST_PROXY set) nothing is loopback: the socket
+ * peer is always nginx on 127.0.0.1, so "is this request local?" cannot be
+ * answered from the address, and the X-Forwarded-For check below only fires
+ * when nginx sets that header. The operator states the topology in
+ * TRUST_PROXY (index.js); this reads the same variable so the two agree.
+ */
+const BEHIND_PROXY = (() => {
+  const raw = process.env.TRUST_PROXY;
+  return raw != null && raw !== '' && raw !== 'false';
+})();
+
 /*
  * Phase 3 · READS TOO.
  *
@@ -64,6 +84,7 @@ function tokenMatches(presented) {
  * definition, and X-Forwarded-For can be set by the caller.
  */
 function isLoopback(req) {
+  if (BEHIND_PROXY) return false;
   if (req.get('x-forwarded-for')) return false;
   const ip = req.ip || req.socket?.remoteAddress || '';
   return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
@@ -110,7 +131,7 @@ function socketMiddleware(socket, next) {
   const presented = socket.handshake?.auth?.token || socket.handshake?.headers?.['x-spread-token'] || null;
   const addr = socket.handshake?.address || '';
   const fwd = socket.handshake?.headers?.['x-forwarded-for'];
-  const local = !fwd && (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
+  const local = !BEHIND_PROXY && !fwd && (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
   if (TOKEN ? tokenMatches(presented) : local) return next();
   const e = new Error(TOKEN ? 'socket requires a token' : 'socket answers loopback only until SPREAD_API_TOKEN is set');
   e.data = { code: 'UNAUTHORISED' };
@@ -126,6 +147,10 @@ function assertProductionConfig({ env = process.env, log: out = log } = {}) {
   const origin = env.CORS_ORIGIN;
   const problems = [];
   if (!TOKEN) problems.push('SPREAD_API_TOKEN is not set — the API and socket answer loopback only');
+  else if (TOKEN.length < MIN_TOKEN_LENGTH) {
+    problems.push(`SPREAD_API_TOKEN is ${TOKEN.length} characters — use at least ${MIN_TOKEN_LENGTH}: `
+      + 'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"');
+  }
   if (!origin || origin === '*') problems.push('CORS_ORIGIN is unset or "*" — set it to the terminal origin');
   if (prod && problems.length) {
     out.error('[auth] refusing to start in production:\n  ' + problems.join('\n  ')
@@ -142,4 +167,4 @@ function assertProductionConfig({ env = process.env, log: out = log } = {}) {
 function warnIfOpen(out = log) { return assertProductionConfig({ log: out }); }
 
 module.exports = { middleware, socketMiddleware, warnIfOpen, assertProductionConfig,
-  tokenMatches, hasToken: () => !!TOKEN };
+  tokenMatches, hasToken: () => !!TOKEN, MIN_TOKEN_LENGTH, isLoopback };

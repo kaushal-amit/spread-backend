@@ -106,6 +106,38 @@ const chk = (t, c, x) => { n++; if (c) p++; else console.log('  FAIL', t, x === 
   chk('zero 500s across the table', all.every((r) => r.status < 500), all.map((r) => r.status));
   chk('every failure carries a code', all.every((r) => r.body && r.body.code), all.filter((r) => !r.body?.code));
 
+  console.log('\n=== body-parser failures are the CLIENT\'s error, not a 500 ===');
+  {
+    const raw = async (body, headers = {}) => {
+      const r = await fetch(`${base}/trading/record`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body });
+      return { status: r.status, body: await r.json().catch(() => null) };
+    };
+    const bad = await raw('{"symbol": ');
+    chk('malformed JSON → 400 BAD_REQUEST', bad.status === 400 && bad.body?.code === 'BAD_REQUEST', bad);
+    const huge = await raw(JSON.stringify({ symbol: 'X', pad: 'x'.repeat(200_000) }));
+    chk('an oversized body → 413 PAYLOAD_TOO_LARGE', huge.status === 413 && huge.body?.code === 'PAYLOAD_TOO_LARGE', huge);
+  }
+
+  console.log('\n=== a concurrency gate releases ONCE per request ===');
+  {
+    const { concurrency } = require('../src/api/ratelimit');
+    const gate = concurrency(2);
+    const EventEmitter = require('events');
+    const pass = () => new Promise((resolve) => {
+      const res = new EventEmitter(); res.status = (c) => ({ json: () => resolve({ code: c }) });
+      gate({}, res, () => resolve({ code: 200, res }));
+    });
+    const a = await pass(), b = await pass();
+    const c = await pass();
+    chk('the third concurrent request is refused (429)', c.code === 429, c);
+    a.res.emit('finish'); a.res.emit('close');          // both events fire on a normal response
+    const d = await pass();
+    chk('one finished request frees ONE slot', d.code === 200);
+    const e = await pass();
+    chk('  — not two (the double-decrement let a third through)', e.code === 429, e);
+    void b;
+  }
+
   console.log('\n=== 3.3 · typed errors from history and the gate store ===');
   const o = await call('GET', '/orders?from=abc');
   chk('history.orders: 400 BAD_REQUEST, not 503 from pg 22007', o.status === 400 && o.body.code === 'BAD_REQUEST', o.body);

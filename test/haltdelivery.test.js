@@ -85,6 +85,29 @@ const rowOf = async (id) => (await pool.query(
     const skip = await whatsapp.sendResume({ ...res, tradeable: false, verdict: 'UP HALT — SKIP' });
     chk('NOT_TRADEABLE, no send', skip.ok === false && skip.reason === 'NOT_TRADEABLE', skip);
 
+    console.log('\n=== H-V1 · a NOT COMPUTED resume pushes a one-line reject naming the missing input ===');
+    // Configured again (the unconfigured block above cleared the env).
+    process.env.WHATSAPP_PROVIDER = 'gupshup';
+    process.env.WHATSAPP_TO = '+96599999999';
+    process.env.WHATSAPP_GUPSHUP_APIKEY = 'gskey';
+    process.env.WHATSAPP_GUPSHUP_SOURCE = '+96500000000';
+    process.env.WHATSAPP_GUPSHUP_APP = 'spreadbot';
+    calls.length = 0;
+    global.fetch = async (url, opts) => { calls.push({ url, opts }); return {
+      ok: true, status: 200, json: async () => ({ status: 'submitted', messageId: 'gs-2' }), text: async () => '' }; };
+    const vd = halts.verdict({ direction: 'DOWN', resumePrice: 149, bidQty: null, offerQty: null, budgetKd: 700 });
+    const nc = halts.payload({ id: null, symbol: 'FTI', at: new Date(), vd, bidQty: null, offerQty: null,
+      bandRefFils: null, history: { halts: 0, gave5: 0, avgGain: null } });
+    chk('the verdict is NOT COMPUTED, not tradeable', nc.verdict === 'NOT COMPUTED' && nc.tradeable === false && nc.notComputed === true, nc);
+    chk('the line reads "FTI resumed 149 · NOT COMPUTED — no book captured"',
+      whatsapp.alertText(nc) === 'FTI resumed 149 · NOT COMPUTED — no book captured', whatsapp.alertText(nc));
+    chk('shouldDeliver: yes for NOT COMPUTED, no for the other rejects',
+      whatsapp.shouldDeliver(nc) === true && whatsapp.shouldDeliver({ ...res, tradeable: false, verdict: 'BOOK TOO DEEP' }) === false);
+    const ncSend = await whatsapp.sendResume(nc);
+    chk('it is SENT', ncSend.ok === true && calls.length === 1, ncSend);
+    chk('  with the reject line', /NOT COMPUTED/.test(decodeURIComponent(calls[0].opts.body).replace(/\+/g, ' ')), calls[0]?.opts.body);
+    chk('null touch quantities stay null in the payload (never 0)', nc.touchBidQty === null && nc.touchOfferQty === null, nc);
+
     await pool.query('DELETE FROM spread.halt_event WHERE symbol = $1', [SYM]);
     console.log(`\n${p}/${n} PASS`);
     if (p !== n) process.exitCode = 1;

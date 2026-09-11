@@ -42,6 +42,44 @@ const call = (srv, method, headers = {}) =>
   }
   srv.close();
 
+  // ── behind a proxy (TRUST_PROXY set): NOTHING is loopback, even without XFF ──
+  // nginx → 127.0.0.1:4000 without proxy_set_header X-Forwarded-For made every
+  // internet request look local, and with the token unset every read and
+  // trading write was open. The topology is stated, not inferred.
+  {
+    process.env.TRUST_PROXY = '1';
+    srv = build(null);
+    await new Promise((r) => srv.listen(0, r));
+    chk('behind proxy, no token · a loopback-looking WRITE without XFF is refused',
+        await call(srv, 'POST') === 401);
+    chk('behind proxy, no token · a loopback-looking READ without XFF is refused',
+        await call(srv, 'GET') === 401);
+    srv.close();
+    delete process.env.TRUST_PROXY;
+  }
+
+  // ── the token floor ──
+  {
+    delete require.cache[require.resolve('../src/api/auth')];
+    process.env.SPREAD_API_TOKEN = 'short8ch';
+    const auth = require('../src/api/auth');
+    const lines = [];
+    const fake = { error: (m) => lines.push(m), warn: (m) => lines.push(m) };
+    chk('production · an 8-character token refuses to start, naming the length and the floor',
+        auth.assertProductionConfig({ env: { NODE_ENV: 'production', CORS_ORIGIN: 'https://t' }, log: fake }) === false
+        && /8 characters — use at least 24/.test(lines.join('\n')), lines);
+    lines.length = 0;
+    chk('development · the same token boots with a warning',
+        auth.assertProductionConfig({ env: { NODE_ENV: 'development', CORS_ORIGIN: 'https://t' }, log: fake }) === true
+        && /8 characters/.test(lines.join('\n')));
+    lines.length = 0;
+    delete require.cache[require.resolve('../src/api/auth')];
+    process.env.SPREAD_API_TOKEN = 'x'.repeat(24);
+    chk('production · 24 characters is the floor and boots',
+        require('../src/api/auth').assertProductionConfig({ env: { NODE_ENV: 'production', CORS_ORIGIN: 'https://t' }, log: fake }) === true, lines);
+    delete process.env.SPREAD_API_TOKEN;
+  }
+
   // ── with a token: READS need it too (Phase 3) — the account is the sensitive surface ──
   srv = build('sekrit');
   await new Promise((r) => srv.listen(0, r));

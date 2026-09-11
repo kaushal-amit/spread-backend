@@ -42,6 +42,29 @@ const T = halts.DEFAULTS;
     chk('a touch bid at/over 50k is BOOK TOO DEEP', V({ direction: 'DOWN', resumePrice: 149, bidQty: 60000, offerQty: 120000 }) === 'BOOK TOO DEEP');
     chk('a skip-list symbol WARNs', V({ direction: 'DOWN', resumePrice: 149, bidQty: 10000, offerQty: 12000, skipReason: '2 halts, none paid' }) === 'WARN');
 
+    console.log('\n=== H-V1 · a missing input is NOT COMPUTED, never a verdict ===');
+    const NC = (o) => halts.verdict({ budgetKd: 700, ...o }, T);
+    chk('null bid AND offer → NOT COMPUTED "no book captured"',
+      NC({ direction: 'DOWN', resumePrice: 149, bidQty: null, offerQty: null }).verdict === 'NOT COMPUTED'
+      && /no book captured/.test(NC({ direction: 'DOWN', resumePrice: 149, bidQty: null, offerQty: null }).verdictDetail));
+    chk('null bid alone → NOT COMPUTED (the old code read it as TRADEABLE)',
+      NC({ direction: 'DOWN', resumePrice: 149, bidQty: null, offerQty: 10000 }).verdict === 'NOT COMPUTED');
+    chk('bid 0 AND offer 0 → NOT COMPUTED "empty book"',
+      /empty book/.test(NC({ direction: 'DOWN', resumePrice: 149, bidQty: 0, offerQty: 0 }).verdictDetail));
+    chk('null direction → NOT COMPUTED naming the direction (was "UP HALT — SKIP")',
+      NC({ direction: null, resumePrice: 149, bidQty: 10000, offerQty: 12000 }).verdict === 'NOT COMPUTED'
+      && /no direction/.test(NC({ direction: null, resumePrice: 149, bidQty: 10000, offerQty: 12000 }).verdictDetail));
+    chk('null resume price → NOT COMPUTED "no resume price"',
+      /no resume price/.test(NC({ direction: 'DOWN', resumePrice: null, bidQty: 10000, offerQty: 12000 }).verdictDetail));
+    chk('every missing input is named at once',
+      NC({ direction: null, resumePrice: null, bidQty: null, offerQty: null }).missing.length === 3);
+    chk('NOT COMPUTED is never tradeable and carries null sizing',
+      (() => { const v = NC({ direction: 'DOWN', resumePrice: 149, bidQty: null, offerQty: null });
+        return v.tradeable === false && v.notComputed === true && v.yourShares === null && v.yourPctBid === null && v.exitMultiple === null; })());
+    chk('CR-1 · a captured bid of 0 with an offer is NO BID (a measurement, not missing)',
+      NC({ direction: 'DOWN', resumePrice: 149, bidQty: 0, offerQty: 5000 }).verdict === 'NO BID');
+    chk('a complete book still grades normally', NC({ direction: 'DOWN', resumePrice: 149, bidQty: 10222, offerQty: 10000 }).verdict === 'TRADEABLE');
+
     console.log('\n=== gate 5 · a second halt today is a CASCADE ===');
     chk('the first halt is not a cascade', V({ direction: 'DOWN', resumePrice: 149, bidQty: 10000, offerQty: 20000, haltCountToday: 0 }) !== 'SECOND HALT — CASCADE');
     chk('a second halt today → SECOND HALT — CASCADE',

@@ -129,7 +129,15 @@ async function screen(tradingDay, budgetKd = BUDGET.slotKd,
       priceFils: closeFils ?? bidFils,
       // Gate 2 prices the ORDER.
       orderPriceFils: bidFils ?? closeFils,
-    }, budgetKd, cfg, { targets, direction, quality });
+    }, budgetKd, cfg, {
+      targets, direction, quality,
+      // Gate 2's net is DATED and MARKET-AWARE: commission.js drops the 0.500
+      // settlement per execution from 1 October 2026 and charges Premier
+      // 0.10% against Main's 0.15%. Neither reached the board before — every
+      // symbol was costed as Main, pre-October, so from 1 Oct the board would
+      // have overstated every round trip by 1 KD and disagreed with the ledger.
+      day: tradingDay, premier: /premier/i.test(String(r.market || '')),
+    });
 
     const entry = bidFils == null ? null : pricing.suggestEntry(
       { bidFils, bidShares: Number(r.live_bid_shares),

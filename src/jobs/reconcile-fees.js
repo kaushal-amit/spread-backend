@@ -72,12 +72,16 @@ function brokerFeeOf(row, side, notional = null) {
 
 async function reconcile(day, { apply = false, db = pool } = {}) {
   const { rows: legs } = await db.query(
-    `SELECT id, symbol, side, price_fils, shares, filled_shares,
-            commission_kd, executions, fee_source, broker_order_id
-       FROM spread.order_leg
-      WHERE trading_day = $1 AND status = 'FILLED'
-        AND COALESCE(fee_source, '') <> 'BROKER'
-      ORDER BY id`, [day]);
+    `SELECT l.id, l.symbol, l.side, l.price_fils, l.shares, l.filled_shares,
+            l.commission_kd, l.executions, l.fee_source, l.broker_order_id,
+            -- Premier pays 0.10% against Main's 0.15%; a re-costing that
+            -- forgets the market writes a wrong FEE_CORRECTION row.
+            (i.market ILIKE '%premier%') AS premier
+       FROM spread.order_leg l
+       LEFT JOIN public.instruments i ON i.symbol = l.symbol
+      WHERE l.trading_day = $1 AND l.status = 'FILLED'
+        AND COALESCE(l.fee_source, '') <> 'BROKER'
+      ORDER BY l.id`, [day]);
 
   const out = { day, legs: legs.length, broker: 0, ambiguous: 0, computed: 0, unmatched: 0,
     adjusted: 0, deltaKd: 0 };
@@ -122,7 +126,7 @@ async function reconcile(day, { apply = false, db = pool } = {}) {
         // split fill can still be corrected.
         const execs = Number(row.executions_observed) || null;
         if (execs && execs > 1 && execs !== Number(leg.executions)) {
-          const better = COMMISSION.sideFeeKd(notional, { day, executions: execs });
+          const better = COMMISSION.sideFeeKd(notional, { day, executions: execs, premier: leg.premier === true });
           const delta = Number((better.kd - computed).toFixed(3));
           out.computed += 1;
           out.deltaKd += delta;

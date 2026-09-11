@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS spread.schema_migration (
   duration_ms int
 );`;
 
-const sha = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 16);
+// Hashed with line endings normalised: a Windows checkout (CRLF) of the same
+// file reported DRIFT against a database migrated from a Linux one, and
+// `npm run migrate` — the Docker CMD — exited 1 for a byte that is not SQL.
+const sha = (s) => crypto.createHash('sha256').update(String(s).replace(/\r\n?/g, '\n')).digest('hex').slice(0, 16);
 
 async function migrate({ dryRun = false, db = pool, log = console } = {}) {
   await db.query(TRACKING);
@@ -107,6 +110,11 @@ async function migrate({ dryRun = false, db = pool, log = console } = {}) {
       const t0 = Date.now();
       try {
         await client.query('BEGIN');
+        // The pool's statement_timeout (20 s) is sized for request queries;
+        // a migration that rewrites a table legitimately runs longer, and a
+        // half-applied migration killed by the timeout is worse than a slow
+        // one. Local to this transaction — SET LOCAL ends with the COMMIT.
+        await client.query('SET LOCAL statement_timeout = 0');
         await client.query(sql);
         await client.query(
           `INSERT INTO spread.schema_migration (filename, checksum, duration_ms)

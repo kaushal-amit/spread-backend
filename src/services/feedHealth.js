@@ -37,23 +37,81 @@ const MAX_AGE_SEC = Number(process.env.FEED_SILENT_SEC || 300);
  * heartbeat table is not present, so a caller can say "unknown" rather than
  * invent an all-ok roster.
  */
-async function roster({ db = pool, maxAgeSec = MAX_AGE_SEC } = {}) {
+/** Is the exchange session open right now (Kuwait, Sun–Thu 09:00–13:30)? */
+function inSessionNow(now = new Date()) {
+  const k = new Date(now.getTime() + 3 * 3600000);
+  const dow = k.getUTCDay(), mins = k.getUTCHours() * 60 + k.getUTCMinutes();
+  return dow !== 5 && dow !== 6 && mins >= 9 * 60 && mins < 13 * 60 + 30;
+}
+
+/**
+ * One feed's status from its heartbeat row. PURE, mirrored line for line from
+ * kse-scraper/src/api/ingest.js feedStatus() — the two must agree.
+ *
+ *   absent    no row: the script never ran
+ *   silent    last check-in older than maxAgeSec
+ *   degraded  checking in, but (in the session) the panel reports a problem,
+ *             or saw 0 rows, or has not had a submission ACCEPTED within
+ *             maxAgeSec — a feed that failed every POST used to read ok, and
+ *             the header rendered its zeros as data
+ *   ok        checked in, delivered, nothing reported
+ */
+function feedStatus(r, { maxAgeSec = MAX_AGE_SEC, inSession = true } = {}) {
+  if (!r) return { status: 'absent', reason: 'never checked in' };
+  if (r.silent_sec == null || r.silent_sec > maxAgeSec) {
+    return { status: 'silent', reason: `no check-in for ${r.silent_sec ?? '?'}s` };
+  }
+  if (r.problem) return { status: 'degraded', reason: `panel reports: ${r.problem}` };
+  if (inSession) {
+    if (r.rows_seen === 0) return { status: 'degraded', reason: 'checking in but sees 0 rows' };
+    const sub = r.submission_sec;
+    if (r.has_submission_clock && (sub == null || sub > maxAgeSec)) {
+      return { status: 'degraded', reason: sub == null ? 'checking in but nothing accepted yet' : `checking in but nothing accepted for ${sub}s` };
+    }
+  }
+  return { status: 'ok', reason: null };
+}
+
+// The scraper's migration 040 adds last_submission_at; a database that has not
+// run it yet is read on the check-in alone. Probed once per process.
+let hasSubmissionClock = null;
+async function submissionClock(db) {
+  if (hasSubmissionClock != null) return hasSubmissionClock;
+  const { rows } = await db.query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'client_heartbeat' AND column_name = 'last_submission_at';`);
+  hasSubmissionClock = rows.length > 0;
+  return hasSubmissionClock;
+}
+
+async function roster({ db = pool, maxAgeSec = MAX_AGE_SEC, inSession = inSessionNow() } = {}) {
   const { rows: [reg] } = await db.query("SELECT to_regclass('public.client_heartbeat') AS t;");
   if (!reg.t) return { available: false, maxAgeSec, scripts: [] };
 
+  const clock = await submissionClock(db);
   const { rows } = await db.query(
-    `SELECT script, version, rows_seen, problem, last_seen_at,
-            EXTRACT(epoch FROM now() - last_seen_at)::int AS silent_sec
-       FROM public.client_heartbeat;`);
+    clock
+      ? `SELECT script, version, rows_seen, problem, last_seen_at, last_submission_at, rows_inserted,
+                EXTRACT(epoch FROM now() - last_seen_at)::int AS silent_sec,
+                EXTRACT(epoch FROM now() - last_submission_at)::int AS submission_sec,
+                true AS has_submission_clock
+           FROM public.client_heartbeat;`
+      : `SELECT script, version, rows_seen, problem, last_seen_at, NULL::timestamptz AS last_submission_at,
+                NULL::int AS rows_inserted,
+                EXTRACT(epoch FROM now() - last_seen_at)::int AS silent_sec,
+                NULL::int AS submission_sec, false AS has_submission_clock
+           FROM public.client_heartbeat;`);
   const byScript = new Map(rows.map((r) => [r.script, r]));
   const scripts = EXPECTED.map((script) => {
     const r = byScript.get(script);
-    if (!r) return { script, status: 'absent', lastSeenAt: null, silentSec: null, rowsSeen: null, problem: null };
+    const st = feedStatus(r, { maxAgeSec, inSession });
+    if (!r) return { script, status: st.status, reason: st.reason, lastSeenAt: null, silentSec: null, rowsSeen: null, problem: null };
     return {
       script,
-      status: r.silent_sec > maxAgeSec ? 'silent' : 'ok',
-      version: r.version, rowsSeen: r.rows_seen, problem: r.problem,
+      status: st.status, reason: st.reason,
+      version: r.version, rowsSeen: r.rows_seen, rowsInserted: r.rows_inserted, problem: r.problem,
       lastSeenAt: r.last_seen_at, silentSec: r.silent_sec,
+      lastSubmissionAt: r.last_submission_at, submissionSec: r.submission_sec,
     };
   });
   return { available: true, maxAgeSec, scripts };
@@ -77,7 +135,7 @@ async function check(tradingDay, { db = pool, maxAgeSec = MAX_AGE_SEC } = {}) {
        ON CONFLICT (table_name, alarm, COALESCE(trading_day, '0001-01-01'::date),
                     COALESCE(column_name, ''), COALESCE(symbol, '')) WHERE resolved_at IS NULL DO NOTHING;`,
       [tradingDay, s.script,
-        s.status === 'absent' ? 'FEED_ABSENT' : 'FEED_SILENT',
+        s.status === 'absent' ? 'FEED_ABSENT' : s.status === 'degraded' ? 'FEED_DEGRADED' : 'FEED_SILENT',
         JSON.stringify({ script: s.script, status: s.status, silentSec: s.silentSec,
           lastSeenAt: s.lastSeenAt, problem: s.problem,
           note: `the ${s.script} feed is ${s.status} — the header must not render zeros as data` })])
@@ -87,4 +145,4 @@ async function check(tradingDay, { db = pool, maxAgeSec = MAX_AGE_SEC } = {}) {
   return { available: true, raised: bad };
 }
 
-module.exports = { roster, check, EXPECTED, MAX_AGE_SEC };
+module.exports = { roster, check, EXPECTED, MAX_AGE_SEC, feedStatus, inSessionNow };
